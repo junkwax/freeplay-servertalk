@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+
+# Cargo lock — keep for binaries, remove for libraries
+# (this is a binary service, so we keep Cargo.lock checked in)
+# Cargo.lock
+
+# Environment / secrets — NEVER commit
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db

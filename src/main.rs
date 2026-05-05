@@ -5,6 +5,7 @@ mod error;
 mod matchmaking;
 mod models;
 mod state;
+mod sweeper;
 mod turn;
 
 use axum::{
@@ -30,6 +31,8 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::Config::from_env()?;
     let state = AppState::new(config).await?;
+
+    sweeper::spawn(state.clone());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

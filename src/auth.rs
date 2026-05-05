@@ -8,20 +8,41 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::Deserialize;
 use serde_json::json;
 use chrono::Utc;
+use uuid::Uuid;
 
-use crate::{error::AppError, models::{Claims, DiscordUser}, state::AppState};
+use crate::{
+    error::AppError,
+    models::{Claims, DiscordUser},
+    state::{AppState, OAuthState},
+};
 
 pub async fn discord_login(State(state): State<AppState>) -> impl IntoResponse {
+    // CSRF protection: generate a one-shot nonce, store it server-side,
+    // round-trip it through Discord as the OAuth `state` parameter, and
+    // verify it on the callback. Without this an attacker can craft a
+    // pre-baked OAuth URL that completes the flow under the victim's
+    // browser session.
+    let nonce = Uuid::new_v4().to_string();
+    state.oauth_states.insert(
+        nonce.clone(),
+        OAuthState { issued_at: Utc::now() },
+    );
+
     let url = format!(
-        "https://discord.com/api/oauth2/authorize?client_id={}&redirect_uri={}&response_type=code&scope=identify",
+        "https://discord.com/api/oauth2/authorize?client_id={}&redirect_uri={}&response_type=code&scope=identify&state={}",
         state.config.discord_client_id,
         urlencoding::encode(&state.config.discord_redirect_uri),
+        urlencoding::encode(&nonce),
     );
     Redirect::temporary(&url)
 }
 
 #[derive(Deserialize)]
-pub struct CallbackParams { code: String }
+pub struct CallbackParams {
+    code: String,
+    /// CSRF nonce echoed back by Discord. Required.
+    state: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct TokenResponse { access_token: String }
@@ -30,6 +51,17 @@ pub async fn discord_callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Validate and consume the CSRF nonce. If missing or unknown, refuse —
+    // we never issued this OAuth attempt. `remove` returns Some only if the
+    // nonce existed; the TTL sweeper drops abandoned nonces in parallel.
+    let nonce = params.state.as_deref().unwrap_or("");
+    if nonce.is_empty() || state.oauth_states.remove(nonce).is_none() {
+        tracing::warn!("[oauth] callback rejected — missing or unknown state nonce");
+        return Err(AppError::Unauthorized(
+            "OAuth state mismatch — restart the login flow from the app".into(),
+        ));
+    }
+
     let token_res: TokenResponse = state.http
         .post("https://discord.com/api/oauth2/token")
         .form(&[
@@ -48,7 +80,11 @@ pub async fn discord_callback(
         .send().await.map_err(|e| AppError::Internal(e.into()))?
         .json().await.map_err(|e| AppError::Internal(e.into()))?;
 
-    let exp = (Utc::now() + chrono::Duration::days(30)).timestamp() as usize;
+    // 7-day JWT (was 30). Long enough that desktop users don't see daily
+    // re-OAuth, short enough that an exfiltrated token doesn't grant a month
+    // of impersonation. A refresh-token flow would let us shorten this further;
+    // not yet implemented.
+    let exp = (Utc::now() + chrono::Duration::days(7)).timestamp() as usize;
     let claims = Claims { sub: user.id.clone(), username: user.username.clone(), exp };
 
     let jwt = encode(

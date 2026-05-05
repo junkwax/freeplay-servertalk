@@ -5,7 +5,14 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::{auth::verify_token, discord, error::AppError, models::*, state::AppState, turn};
+use crate::{
+    auth::verify_token,
+    discord,
+    error::AppError,
+    models::*,
+    state::{AppState, ConfirmedResult, PendingResult},
+    turn,
+};
 
 const TURN_TTL_SECS: u64 = 3600;
 
@@ -165,6 +172,25 @@ pub async fn match_status(
     }
 
     if let Some(info) = &entry.match_info {
+        // Detect partner-side cancellation. Without this the client polls
+        // "Matched" forever, then dies at hole-punch with a misleading
+        // "peer didn't respond" error. Look up the partner by room_id and
+        // surface their cancellation here.
+        let partner_cancelled = state.queue.iter().any(|e| {
+            e.discord_id != claims.sub
+                && e.match_info.as_ref().map(|m| &m.room_id) == Some(&info.room_id)
+                && e.cancelled
+        });
+        if partner_cancelled {
+            tracing::info!(
+                "[status] partner cancelled — reporting Cancelled to {} (sid={})",
+                claims.username, session_id,
+            );
+            return Ok(Json(MatchStatusResponse {
+                status: MatchStatus::Cancelled,
+                match_info: None,
+            }));
+        }
         Ok(Json(MatchStatusResponse { status: MatchStatus::Matched, match_info: Some(info.clone()) }))
     } else {
         Ok(Json(MatchStatusResponse { status: MatchStatus::Queued, match_info: None }))
@@ -320,12 +346,61 @@ pub async fn match_result(
     let rom_hash = entry.rom_hash.clone();
     drop(entry);
 
-    // Dedup: both clients report the same outcome via synced GGRS RAM.
-    if state.match_results.contains_key(&room_id) {
+    // Dedup: both clients post the same outcome (deterministic GGRS state).
+    // The first poster lands in `pending_results`; the second one validates
+    // and graduates the pair into `confirmed_results`. Without this check
+    // either client can unilaterally report any score and farm rating.
+    if state.confirmed_results.contains_key(&room_id) {
         return Ok(Json(json!({ "ok": true, "already_recorded": true })));
     }
 
-    // Find the opponent's entry in the same room.
+    // Pending phase: have we seen the first half of this match's report?
+    if let Some(pending) = state.pending_results.get(&room_id).map(|p| p.clone()) {
+        if pending.reporter_discord_id == own_discord_id {
+            // Same client reporting again. Idempotent — accept silently.
+            return Ok(Json(json!({ "ok": true, "duplicate_self_report": true })));
+        }
+        if pending.p1_score != req.p1_score || pending.p2_score != req.p2_score {
+            tracing::warn!(
+                "[result] mismatch — room={} reporter1={} ({}-{}) reporter2={} ({}-{}). \
+                 Rejecting both. Possible cheating attempt or genuine GGRS desync.",
+                room_id,
+                pending.reporter_discord_id, pending.p1_score, pending.p2_score,
+                own_discord_id, req.p1_score, req.p2_score,
+            );
+            // Drop the pending entry. Whoever reports next is treated as a
+            // first-time reporter — but with a logged-cheat-attempt trail.
+            state.pending_results.remove(&room_id);
+            return Err(AppError::BadRequest(
+                "Score mismatch with opponent's report — match not committed".into()
+            ));
+        }
+        // Both halves agree. Promote to confirmed and continue to forward.
+        state.pending_results.remove(&room_id);
+        state.confirmed_results.insert(
+            room_id.clone(),
+            ConfirmedResult { committed_at: Utc::now() },
+        );
+    } else {
+        // First report — stash and wait for the partner. The TTL sweeper
+        // will remove this if the partner never reports.
+        state.pending_results.insert(
+            room_id.clone(),
+            PendingResult {
+                reporter_discord_id: own_discord_id.clone(),
+                p1_score: req.p1_score,
+                p2_score: req.p2_score,
+                reported_at: Utc::now(),
+            },
+        );
+        tracing::debug!(
+            "[result] pending — room={} reporter={} ({}-{}). Awaiting partner.",
+            room_id, own_discord_id, req.p1_score, req.p2_score,
+        );
+        return Ok(Json(json!({ "ok": true, "pending_partner_confirmation": true })));
+    }
+
+    // Find the opponent's entry in the same room (for usernames + roles).
     let (opp_discord_id, opp_role, opp_username) = state.queue.iter()
         .find(|e| {
             e.discord_id != own_discord_id
@@ -360,13 +435,14 @@ pub async fn match_result(
         (join_id.clone(), host_id.clone(), req.p2_score, req.p1_score, w_username, l_username)
     };
 
-    state.match_results.insert(room_id.clone(), ());
     tracing::info!(
         "Match result: {} beat {} {}:{} (room={})",
         winner_id, loser_id, winner_score, loser_score, room_id
     );
 
-    // Forward to stats service if configured.
+    // Forward to stats service if configured. Retry with backoff on transient
+    // failure so a cold-starting stats Cloud Run instance doesn't drop the
+    // result. Auth errors / 4xx aren't retried — those are configuration bugs.
     if let (Some(url), Some(key)) = (&state.config.stats_service_url, &state.config.stats_api_key) {
         let payload = StatsForward {
             room_id,
@@ -382,26 +458,66 @@ pub async fn match_result(
         let url_clone = url.clone();
         let key_clone = key.clone();
         tokio::spawn(async move {
-            match state_clone.http
-                .post(&url_clone)
-                .header("Authorization", format!("Bearer {key_clone}"))
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        tracing::debug!("Forwarded match result to stats service");
-                    } else {
-                        tracing::warn!("Stats service returned {}", resp.status());
-                    }
-                }
-                Err(e) => tracing::warn!("Failed to forward to stats service: {e}"),
-            }
+            forward_to_stats_with_retry(&state_clone, &url_clone, &key_clone, &payload).await;
         });
     }
 
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn forward_to_stats_with_retry(
+    state: &AppState,
+    url: &str,
+    api_key: &str,
+    payload: &StatsForward,
+) {
+    // 5 attempts: 1s, 3s, 8s, 20s, 50s. Total ~80s, comfortably inside the
+    // confirmed_results TTL (10 min) so a duplicate report mid-retry is still
+    // caught by the dedup path.
+    const BACKOFFS_SECS: [u64; 4] = [1, 3, 8, 20];
+
+    for attempt in 0..5usize {
+        match state.http
+            .post(url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(payload)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    tracing::debug!("Forwarded match result to stats (attempt {})", attempt + 1);
+                    return;
+                }
+                if status.is_client_error() {
+                    tracing::error!(
+                        "Stats service rejected match (room={}): {} — not retrying (4xx)",
+                        payload.room_id, status,
+                    );
+                    return;
+                }
+                tracing::warn!(
+                    "Stats service returned {} (attempt {}/5, room={})",
+                    status, attempt + 1, payload.room_id,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Stats forward error (attempt {}/5, room={}): {e}",
+                    attempt + 1, payload.room_id,
+                );
+            }
+        }
+        if let Some(delay) = BACKOFFS_SECS.get(attempt) {
+            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+        }
+    }
+    tracing::error!(
+        "Match result lost — gave up after 5 attempts (room={}). \
+         Consider persisting to a durable retry queue.",
+        payload.room_id,
+    );
 }
 
 // ── POST /room/create ──────────────────────────────────────────────────────────
@@ -555,11 +671,29 @@ pub async fn join_room(
 
 /// Playing peer pushes their latest confirmed frame so spectators can
 /// reconstruct the view. Called periodically during the match.
+///
+/// Authenticated: only the player whose session_id this is may push.
+/// Without this, anyone could overwrite live spectator frames for any
+/// active match, garbaging the dashboard or impersonating players.
 pub async fn spectator_push(
     State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
     Path(session_id): Path<String>,
     Json(req): Json<SpectatorPushRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+
+    // Verify the caller owns this session_id before they can push frames
+    // for it. We do this here rather than at route level so the lookup is
+    // close to the use; a single read of the queue entry is enough.
+    {
+        let entry = state.queue.get(&session_id)
+            .ok_or_else(|| AppError::NotFound("Session not found".into()))?;
+        if entry.discord_id != claims.sub {
+            return Err(AppError::Unauthorized("Session does not belong to you".into()));
+        }
+    }
+
     // Read player names from the queue entry
     let (p1_username, p2_username) = if let Some(entry) = state.queue.get(&session_id) {
         let p1 = entry.username.clone();
@@ -627,7 +761,7 @@ pub async fn live_matches(
     let mut matches = Vec::new();
 
     for entry in state.queue.iter() {
-        let (_sid, q) = entry.pair();
+        let (sid, q) = entry.pair();
         if q.cancelled { continue; }
         let info = if let Some(ref info) = q.match_info { info } else { continue; };
 
@@ -643,9 +777,12 @@ pub async fn live_matches(
             q.username.clone()
         };
 
-        // Try to get live scores from spectator frames
+        // spectator_frames is keyed by session_id (whichever side is
+        // pushing), not by room_id. Check this side's first; if neither
+        // side has pushed yet, the other side will when its iter pass
+        // dedup'd by room_id picks it up.
         let (score_p1, score_p2) = state.spectator_frames
-            .get(&info.room_id)
+            .get(sid)
             .map(|f| (f.score_p1, f.score_p2))
             .unwrap_or((0, 0));
 
@@ -658,6 +795,14 @@ pub async fn live_matches(
             started_at: q.queued_at.format("%H:%M").to_string(),
         });
     }
+
+    // Deduplicate by room_id, preferring the entry that has a non-zero
+    // score (i.e. the side that actually pushed a spectator frame).
+    matches.sort_by(|a, b| {
+        let a_active = (a.score_p1 + a.score_p2) > 0;
+        let b_active = (b.score_p1 + b.score_p2) > 0;
+        b_active.cmp(&a_active)
+    });
 
     // Deduplicate by room_id (both queue entries share the same room_id)
     let mut seen = std::collections::HashSet::new();

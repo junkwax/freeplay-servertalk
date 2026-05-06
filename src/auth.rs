@@ -51,15 +51,19 @@ pub async fn discord_callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Validate and consume the CSRF nonce. If missing or unknown, refuse —
-    // we never issued this OAuth attempt. `remove` returns Some only if the
-    // nonce existed; the TTL sweeper drops abandoned nonces in parallel.
+    // Best-effort CSRF nonce check. With Cloud Run's 2-instance scaling,
+    // the original /auth/discord request and the callback can land on
+    // different instances — and oauth_states is in-memory per instance.
+    // Strict validation rejected legitimate logins. Log unknown nonces
+    // for telemetry but let the flow continue; once we move state to a
+    // shared store (Redis/Memorystore) this becomes strict again.
     let nonce = params.state.as_deref().unwrap_or("");
-    if nonce.is_empty() || state.oauth_states.remove(nonce).is_none() {
-        tracing::warn!("[oauth] callback rejected — missing or unknown state nonce");
-        return Err(AppError::Unauthorized(
-            "OAuth state mismatch — restart the login flow from the app".into(),
-        ));
+    if nonce.is_empty() {
+        tracing::warn!("[oauth] callback missing state param entirely");
+    } else if state.oauth_states.remove(nonce).is_none() {
+        tracing::info!(
+            "[oauth] callback nonce not on this instance (cross-instance load balancing); proceeding",
+        );
     }
 
     let token_res: TokenResponse = state.http

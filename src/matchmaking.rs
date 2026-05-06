@@ -32,11 +32,32 @@ pub async fn looking_for_game(
 
     if let Some(old_sid) = state.player_sessions.get(&claims.sub).map(|s| s.clone()) {
         if let Some((_, old)) = state.queue.remove(&old_sid) {
-            if old.match_info.is_some() && !old.cancelled {
-                tracing::warn!(
-                    "{} re-queued while still matched (sid={}); peer will see a stale session",
-                    claims.username, old_sid
-                );
+            // If the player was already in a matched session when they
+            // re-queued, their previous opponent is still polling
+            // /match/status with that room_id and would otherwise see
+            // "Matched" forever pointing at a peer endpoint that no
+            // longer exists. Explicitly mark the partner cancelled so
+            // they get a clean error instead of a 10-second hole-punch
+            // timeout. Without this, the player who DIDN'T re-queue
+            // experiences "matchmaking timed out for no apparent
+            // reason" — the symptom we saw with junkwaxc + sudden_recline.
+            if let Some(info) = &old.match_info {
+                if !old.cancelled {
+                    let partner_keys: Vec<String> = state.queue.iter()
+                        .filter(|e| e.discord_id != claims.sub
+                            && e.match_info.as_ref().map(|m| &m.room_id) == Some(&info.room_id))
+                        .map(|e| e.key().clone())
+                        .collect();
+                    for k in partner_keys {
+                        if let Some(mut partner) = state.queue.get_mut(&k) {
+                            partner.cancelled = true;
+                            tracing::warn!(
+                                "Cascading cancel to partner {} (sid={}) because {} re-queued from a stale match (room={})",
+                                partner.username, k, claims.username, info.room_id,
+                            );
+                        }
+                    }
+                }
             }
         }
     }

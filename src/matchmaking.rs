@@ -90,7 +90,10 @@ pub async fn looking_for_game(
 
         let room_id = Uuid::new_v4().to_string();
         let punch_at_ms = (Utc::now() + chrono::Duration::milliseconds(2500)).timestamp_millis();
-        let turn_creds = mint_turn_for_room(&state, &room_id);
+        // Each peer gets a credential carrying ITS role. Relay HMAC is
+        // <role>:<expiry>:<room_id>, so per-role minting is required.
+        let host_creds = mint_turn_for_room(&state, &room_id, 0);
+        let join_creds = mint_turn_for_room(&state, &room_id, 1);
 
         opp_ref.match_info = Some(MatchInfo {
             role: PlayerRole::Host,
@@ -98,7 +101,7 @@ pub async fn looking_for_game(
             punch_at_ms,
             room_id: room_id.clone(),
             username: claims.username.clone(),
-            turn: turn_creds.clone(),
+            turn: host_creds.clone(),
         });
 
         claimed = Some((
@@ -106,12 +109,12 @@ pub async fn looking_for_game(
             opp_ref.stun_endpoint.clone(),
             room_id,
             punch_at_ms,
-            turn_creds,
+            join_creds,
         ));
         break;
     }
 
-    if let Some((opp_username, opp_stun, room_id, punch_at_ms, turn_creds)) = claimed {
+    if let Some((opp_username, opp_stun, room_id, punch_at_ms, join_creds)) = claimed {
         state.queue.insert(session_id.clone(), QueueEntry {
             session_id: session_id.clone(),
             discord_id: claims.sub.clone(),
@@ -126,7 +129,7 @@ pub async fn looking_for_game(
                 punch_at_ms,
                 room_id,
                 username: opp_username.clone(),
-                turn: turn_creds,
+                turn: join_creds,
             }),
             cancelled: false,
             relayed_addr: None,
@@ -164,13 +167,19 @@ pub async fn looking_for_game(
     }
 }
 
-fn mint_turn_for_room(state: &AppState, room_id: &str) -> Option<TurnCredentials> {
+/// Mint a relay credential for one peer in a match.
+///
+/// Each peer needs its OWN credential (with their role baked in) because
+/// the relay HMACs `<role>:<expiry>:<room_id>`. Pre-relay (coturn era)
+/// both peers shared one credential; the new design's per-role HMAC
+/// means we mint twice per match.
+fn mint_turn_for_room(state: &AppState, room_id: &str, role: u8) -> Option<TurnCredentials> {
     if !state.config.turn_enabled() {
         return None;
     }
     let ip = state.config.turn_server_ip.as_ref()?;
     let secret = state.config.turn_shared_secret.as_ref()?;
-    Some(turn::mint_credentials(secret, ip, room_id, TURN_TTL_SECS))
+    Some(turn::mint_credentials(secret, ip, room_id, role, TURN_TTL_SECS))
 }
 
 // ── GET /match/status/:session_id ─────────────────────────────────────────────
@@ -657,7 +666,8 @@ pub async fn join_room(
     let joiner_session_id = Uuid::new_v4().to_string();
     let match_room_id = Uuid::new_v4().to_string();
     let punch_at_ms = (Utc::now() + chrono::Duration::milliseconds(2500)).timestamp_millis();
-    let turn_creds = mint_turn_for_room(&state, &match_room_id);
+    let host_creds = mint_turn_for_room(&state, &match_room_id, 0);
+    let join_creds = mint_turn_for_room(&state, &match_room_id, 1);
 
     // Copy the creator's STUN endpoint before we overwrite their entry
     let creator_stun = creator_entry.stun_endpoint.clone();
@@ -669,7 +679,7 @@ pub async fn join_room(
         punch_at_ms,
         room_id: match_room_id.clone(),
         username: claims.username.clone(),
-        turn: turn_creds.clone(),
+        turn: host_creds,
     });
 
     // Create joiner's entry: they are Join
@@ -687,7 +697,7 @@ pub async fn join_room(
             punch_at_ms,
             room_id: match_room_id.clone(),
             username: room.creator_username.clone(),
-            turn: turn_creds.clone(),
+            turn: join_creds.clone(),
         }),
         cancelled: false,
         relayed_addr: None,
@@ -709,7 +719,7 @@ pub async fn join_room(
             punch_at_ms,
             room_id: match_room_id,
             username: room.creator_username.clone(),
-            turn: turn_creds,
+            turn: join_creds,
         },
     }))
 }

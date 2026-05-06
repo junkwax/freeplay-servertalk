@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod discord;
 mod error;
+mod incidents;
 mod matchmaking;
 mod models;
 mod state;
@@ -67,6 +68,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/spectate/state/:session_id",   get(matchmaking::spectator_state))
         // Live matches dashboard — community public feed
         .route("/matches/live",                 get(matchmaking::live_matches))
+        // Incident logging — clients post a JSON blob describing a
+        // failed match (hole-punch failure, GGRS desync, score mismatch).
+        // The server stores it in GCS for offline investigation.
+        .route("/match/incident",               post(incidents::submit_incident))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

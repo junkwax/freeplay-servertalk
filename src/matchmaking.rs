@@ -9,6 +9,7 @@ use crate::{
     auth::verify_token,
     discord,
     error::AppError,
+    incidents::{record_server_incident, ServerIncident},
     models::*,
     state::{AppState, ConfirmedResult, PendingResult},
     turn,
@@ -368,6 +369,31 @@ pub async fn match_result(
                 pending.reporter_discord_id, pending.p1_score, pending.p2_score,
                 own_discord_id, req.p1_score, req.p2_score,
             );
+            // Capture an incident before we drop the pending entry. The
+            // bucket record is the only persistent trace once the in-memory
+            // queue/pending state is reaped — without it the warn! above
+            // is the entire investigation surface.
+            record_server_incident(&state, ServerIncident {
+                kind: "score_mismatch".into(),
+                summary: format!(
+                    "{} reported {}-{}; {} reported {}-{}",
+                    pending.reporter_discord_id, pending.p1_score, pending.p2_score,
+                    own_discord_id, req.p1_score, req.p2_score,
+                ),
+                room_id: room_id.clone(),
+                session_ids: vec![req.session_id.clone()],
+                usernames: vec![own_username.clone()],
+                details: serde_json::json!({
+                    "first_reporter_discord_id": pending.reporter_discord_id,
+                    "first_reporter_p1": pending.p1_score,
+                    "first_reporter_p2": pending.p2_score,
+                    "second_reporter_discord_id": own_discord_id,
+                    "second_reporter_p1": req.p1_score,
+                    "second_reporter_p2": req.p2_score,
+                    "first_reported_at": pending.reported_at.to_rfc3339(),
+                    "rom_hash": rom_hash,
+                }),
+            });
             // Drop the pending entry. Whoever reports next is treated as a
             // first-time reporter — but with a logged-cheat-attempt trail.
             state.pending_results.remove(&room_id);

@@ -12,6 +12,7 @@
 use std::time::Duration;
 use chrono::Utc;
 
+use crate::incidents::{record_server_incident, ServerIncident};
 use crate::state::AppState;
 
 /// Queue entries (lfg, status polling, post-match holdover) older than this
@@ -105,6 +106,70 @@ fn sweep_once(state: &AppState) -> SweepCounts {
         .collect();
     for key in stale {
         if let Some((_, entry)) = state.queue.remove(&key) {
+            // Detect "match never happened" cases that warrant an incident.
+            //
+            // - matched_no_result: queue entry was matched (had MatchInfo),
+            //   wasn't cancelled, but no committed result for the room. Means
+            //   the players paired, then something killed the session before
+            //   /match/result was posted. Either side reporting a result
+            //   would have transferred the room into confirmed_results.
+            //
+            // - lfg_no_pair: entry reached its TTL still in Queued state.
+            //   Means matchmaking couldn't find a partner — different ROM
+            //   hash, different app version, or just nobody else around.
+            //   Less interesting on a quiet day but worth flagging.
+            if !entry.cancelled {
+                if let Some(info) = &entry.match_info {
+                    let confirmed = state.confirmed_results.contains_key(&info.room_id);
+                    if !confirmed {
+                        record_server_incident(state, ServerIncident {
+                            kind: "matched_no_result".into(),
+                            summary: format!(
+                                "Match {} between {} and {} reaped after {}s with no result",
+                                info.room_id,
+                                entry.username,
+                                info.username,
+                                (now - entry.queued_at).num_seconds(),
+                            ),
+                            room_id: info.room_id.clone(),
+                            session_ids: vec![entry.session_id.clone()],
+                            usernames: vec![entry.username.clone(), info.username.clone()],
+                            details: serde_json::json!({
+                                "role": format!("{:?}", info.role),
+                                "peer_endpoint": info.peer_endpoint,
+                                "punch_at_ms": info.punch_at_ms,
+                                "had_turn_creds": info.turn.is_some(),
+                                "rom_hash": entry.rom_hash,
+                                "app_version": entry.app_version,
+                                "queued_at": entry.queued_at.to_rfc3339(),
+                                "reaped_at": now.to_rfc3339(),
+                            }),
+                        });
+                    }
+                } else {
+                    record_server_incident(state, ServerIncident {
+                        kind: "lfg_no_pair".into(),
+                        summary: format!(
+                            "{} sat in queue {}s without finding a partner (rom={}, app={})",
+                            entry.username,
+                            (now - entry.queued_at).num_seconds(),
+                            entry.rom_hash,
+                            entry.app_version,
+                        ),
+                        room_id: String::new(),
+                        session_ids: vec![entry.session_id.clone()],
+                        usernames: vec![entry.username.clone()],
+                        details: serde_json::json!({
+                            "rom_hash": entry.rom_hash,
+                            "app_version": entry.app_version,
+                            "stun_endpoint": entry.stun_endpoint,
+                            "queued_at": entry.queued_at.to_rfc3339(),
+                            "reaped_at": now.to_rfc3339(),
+                        }),
+                    });
+                }
+            }
+
             // If this player still has us as their session pointer, drop it.
             // Avoids a future LFG seeing a "stuck" session_id.
             if let Some(sid) = state.player_sessions.get(&entry.discord_id).map(|s| s.clone()) {

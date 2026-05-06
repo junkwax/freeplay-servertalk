@@ -145,6 +145,28 @@ done
 echo "  ✓ Access granted"
 echo ""
 
+# ── 3b. Ensure incidents bucket exists & SA has write access ──────────────────
+# Created lazily so first-run deploys don't need a separate provisioning step.
+# The bucket has a 90-day lifecycle policy that auto-deletes old incidents.
+INCIDENTS_BUCKET="${PROJECT_ID}-freeplay-incidents"
+if ! gcloud storage buckets describe "gs://${INCIDENTS_BUCKET}" --project="${PROJECT_ID}" &>/dev/null; then
+  echo "  Creating incidents bucket: gs://${INCIDENTS_BUCKET}"
+  gcloud storage buckets create "gs://${INCIDENTS_BUCKET}" \
+    --project="${PROJECT_ID}" --location="${REGION}" --uniform-bucket-level-access >/dev/null
+  cat > /tmp/incidents-lifecycle.json <<EOF
+{"rule":[{"action":{"type":"Delete"},"condition":{"age":90}}]}
+EOF
+  gcloud storage buckets update "gs://${INCIDENTS_BUCKET}" \
+    --lifecycle-file=/tmp/incidents-lifecycle.json >/dev/null
+fi
+gcloud storage buckets add-iam-policy-binding "gs://${INCIDENTS_BUCKET}" \
+  --member="serviceAccount:${COMPUTE_SA}" \
+  --role="roles/storage.objectAdmin" \
+  --condition=None \
+  >/dev/null 2>&1 || true
+echo "  ✓ Incidents bucket: gs://${INCIDENTS_BUCKET}"
+echo ""
+
 # ── 4. Build image via Cloud Build ────────────────────────────────────────────
 echo "[4/5] Building image on Cloud Build..."
 gcloud builds submit --tag "${IMAGE}" --project="${PROJECT_ID}"

@@ -1,5 +1,11 @@
-use axum::{extract::{Path, State}, response::Json};
-use axum_extra::{headers::{Authorization, authorization::Bearer}, TypedHeader};
+use axum::{
+    extract::{Path, State},
+    response::Json,
+};
+use axum_extra::{
+    headers::{authorization::Bearer, Authorization},
+    TypedHeader,
+};
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::json;
@@ -43,9 +49,13 @@ pub async fn looking_for_game(
             // reason" — the symptom we saw with junkwaxc + sudden_recline.
             if let Some(info) = &old.match_info {
                 if !old.cancelled {
-                    let partner_keys: Vec<String> = state.queue.iter()
-                        .filter(|e| e.discord_id != claims.sub
-                            && e.match_info.as_ref().map(|m| &m.room_id) == Some(&info.room_id))
+                    let partner_keys: Vec<String> = state
+                        .queue
+                        .iter()
+                        .filter(|e| {
+                            e.discord_id != claims.sub
+                                && e.match_info.as_ref().map(|m| &m.room_id) == Some(&info.room_id)
+                        })
                         .map(|e| e.key().clone())
                         .collect();
                     for k in partner_keys {
@@ -69,7 +79,9 @@ pub async fn looking_for_game(
     // one atomically via get_mut + re-check. This closes the TOCTOU window
     // between find and get_mut, and avoids holding an iter while taking a
     // mutable shard lock (which dashmap will deadlock on).
-    let candidate_keys: Vec<String> = state.queue.iter()
+    let candidate_keys: Vec<String> = state
+        .queue
+        .iter()
         .filter(|e| {
             !e.cancelled
                 && e.match_info.is_none()
@@ -82,7 +94,9 @@ pub async fn looking_for_game(
 
     let mut claimed = None;
     for k in candidate_keys {
-        let Some(mut opp_ref) = state.queue.get_mut(&k) else { continue };
+        let Some(mut opp_ref) = state.queue.get_mut(&k) else {
+            continue;
+        };
         // Re-check under the mut lock — another request may have just claimed them.
         if opp_ref.cancelled || opp_ref.match_info.is_some() {
             continue;
@@ -115,55 +129,74 @@ pub async fn looking_for_game(
     }
 
     if let Some((opp_username, opp_stun, room_id, punch_at_ms, join_creds)) = claimed {
-        state.queue.insert(session_id.clone(), QueueEntry {
-            session_id: session_id.clone(),
-            discord_id: claims.sub.clone(),
-            username: claims.username.clone(),
-            stun_endpoint: req.stun_endpoint.clone(),
-            app_version: req.app_version.clone(),
-            rom_hash: req.rom_hash.clone(),
-            queued_at: Utc::now(),
-            match_info: Some(MatchInfo {
-                role: PlayerRole::Join,
-                peer_endpoint: opp_stun,
-                punch_at_ms,
-                room_id,
-                username: opp_username.clone(),
-                turn: join_creds,
-            }),
-            cancelled: false,
-            relayed_addr: None,
-        });
+        state.queue.insert(
+            session_id.clone(),
+            QueueEntry {
+                session_id: session_id.clone(),
+                discord_id: claims.sub.clone(),
+                username: claims.username.clone(),
+                stun_endpoint: req.stun_endpoint.clone(),
+                app_version: req.app_version.clone(),
+                rom_hash: req.rom_hash.clone(),
+                queued_at: Utc::now(),
+                match_info: Some(MatchInfo {
+                    role: PlayerRole::Join,
+                    peer_endpoint: opp_stun,
+                    punch_at_ms,
+                    room_id,
+                    username: opp_username.clone(),
+                    turn: join_creds,
+                }),
+                cancelled: false,
+                relayed_addr: None,
+            },
+        );
 
-        state.player_sessions.insert(claims.sub.clone(), session_id.clone());
+        state
+            .player_sessions
+            .insert(claims.sub.clone(), session_id.clone());
 
         let (s, u1, u2) = (state.clone(), claims.username.clone(), opp_username.clone());
         tokio::spawn(async move { discord::notify_matched(&s, &u1, &u2).await });
 
-        tracing::info!("Matched {} vs {} (rom={})",
-            claims.username, opp_username, &req.rom_hash);
-        Ok(Json(LfgResponse { session_id, status: MatchStatus::Matched }))
-
+        tracing::info!(
+            "Matched {} vs {} (rom={})",
+            claims.username,
+            opp_username,
+            &req.rom_hash
+        );
+        Ok(Json(LfgResponse {
+            session_id,
+            status: MatchStatus::Matched,
+        }))
     } else {
-        state.queue.insert(session_id.clone(), QueueEntry {
-            session_id: session_id.clone(),
-            discord_id: claims.sub.clone(),
-            username: claims.username.clone(),
-            stun_endpoint: req.stun_endpoint,
-            app_version: req.app_version,
-            rom_hash: req.rom_hash.clone(),
-            queued_at: Utc::now(),
-            match_info: None,
-            cancelled: false,
-            relayed_addr: None,
-        });
-        state.player_sessions.insert(claims.sub.clone(), session_id.clone());
+        state.queue.insert(
+            session_id.clone(),
+            QueueEntry {
+                session_id: session_id.clone(),
+                discord_id: claims.sub.clone(),
+                username: claims.username.clone(),
+                stun_endpoint: req.stun_endpoint,
+                app_version: req.app_version,
+                rom_hash: req.rom_hash.clone(),
+                queued_at: Utc::now(),
+                match_info: None,
+                cancelled: false,
+                relayed_addr: None,
+            },
+        );
+        state
+            .player_sessions
+            .insert(claims.sub.clone(), session_id.clone());
 
         let (s, u) = (state.clone(), claims.username.clone());
         tokio::spawn(async move { discord::notify_lfg(&s, &u).await });
 
         tracing::info!("Queued {} (rom={})", claims.username, &req.rom_hash);
-        Ok(Json(LfgResponse { session_id, status: MatchStatus::Queued }))
+        Ok(Json(LfgResponse {
+            session_id,
+            status: MatchStatus::Queued,
+        }))
     }
 }
 
@@ -179,7 +212,13 @@ fn mint_turn_for_room(state: &AppState, room_id: &str, role: u8) -> Option<TurnC
     }
     let ip = state.config.turn_server_ip.as_ref()?;
     let secret = state.config.turn_shared_secret.as_ref()?;
-    Some(turn::mint_credentials(secret, ip, room_id, role, TURN_TTL_SECS))
+    Some(turn::mint_credentials(
+        secret,
+        ip,
+        room_id,
+        role,
+        TURN_TTL_SECS,
+    ))
 }
 
 // ── GET /match/status/:session_id ─────────────────────────────────────────────
@@ -191,18 +230,28 @@ pub async fn match_status(
 ) -> Result<Json<MatchStatusResponse>, AppError> {
     let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
 
-    let entry = state.queue.get(&session_id)
+    let entry = state
+        .queue
+        .get(&session_id)
         .ok_or_else(|| AppError::NotFound("Session not found".into()))?;
 
     if entry.discord_id != claims.sub {
-        return Err(AppError::Unauthorized("Session does not belong to you".into()));
+        return Err(AppError::Unauthorized(
+            "Session does not belong to you".into(),
+        ));
     }
 
     if entry.cancelled {
-        return Ok(Json(MatchStatusResponse { status: MatchStatus::Cancelled, match_info: None }));
+        return Ok(Json(MatchStatusResponse {
+            status: MatchStatus::Cancelled,
+            match_info: None,
+        }));
     }
 
-    if let Some(info) = &entry.match_info {
+    let info = entry.match_info.clone();
+    drop(entry);
+
+    if let Some(info) = info {
         // Detect partner-side cancellation. Without this the client polls
         // "Matched" forever, then dies at hole-punch with a misleading
         // "peer didn't respond" error. Look up the partner by room_id and
@@ -215,16 +264,23 @@ pub async fn match_status(
         if partner_cancelled {
             tracing::info!(
                 "[status] partner cancelled — reporting Cancelled to {} (sid={})",
-                claims.username, session_id,
+                claims.username,
+                session_id,
             );
             return Ok(Json(MatchStatusResponse {
                 status: MatchStatus::Cancelled,
                 match_info: None,
             }));
         }
-        Ok(Json(MatchStatusResponse { status: MatchStatus::Matched, match_info: Some(info.clone()) }))
+        Ok(Json(MatchStatusResponse {
+            status: MatchStatus::Matched,
+            match_info: Some(info),
+        }))
     } else {
-        Ok(Json(MatchStatusResponse { status: MatchStatus::Queued, match_info: None }))
+        Ok(Json(MatchStatusResponse {
+            status: MatchStatus::Queued,
+            match_info: None,
+        }))
     }
 }
 
@@ -235,7 +291,7 @@ pub async fn cancel_queue(
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
-    if let Some(sid) = state.player_sessions.get(&claims.sub) {
+    if let Some(sid) = state.player_sessions.get(&claims.sub).map(|s| s.clone()) {
         if let Some(mut e) = state.queue.get_mut(sid.as_str()) {
             e.cancelled = true;
         }
@@ -262,16 +318,23 @@ pub async fn turn_ready(
         return Err(AppError::BadRequest("Invalid relayed_addr".into()));
     }
 
-    let mut entry = state.queue.get_mut(&session_id)
+    let mut entry = state
+        .queue
+        .get_mut(&session_id)
         .ok_or_else(|| AppError::NotFound("Session not found".into()))?;
 
     if entry.discord_id != claims.sub {
-        return Err(AppError::Unauthorized("Session does not belong to you".into()));
+        return Err(AppError::Unauthorized(
+            "Session does not belong to you".into(),
+        ));
     }
 
     entry.relayed_addr = Some(req.relayed_addr.clone());
-    tracing::info!("[turn-ready] {} relayed_addr={}",
-        entry.username, req.relayed_addr);
+    tracing::info!(
+        "[turn-ready] {} relayed_addr={}",
+        entry.username,
+        req.relayed_addr
+    );
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -289,27 +352,37 @@ pub async fn peer_relay(
 ) -> Result<Json<PeerRelayResponse>, AppError> {
     let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
 
-    let entry = state.queue.get(&session_id)
+    let entry = state
+        .queue
+        .get(&session_id)
         .ok_or_else(|| AppError::NotFound("Session not found".into()))?;
 
     if entry.discord_id != claims.sub {
-        return Err(AppError::Unauthorized("Session does not belong to you".into()));
+        return Err(AppError::Unauthorized(
+            "Session does not belong to you".into(),
+        ));
     }
 
-    let info = entry.match_info.as_ref()
+    let info = entry
+        .match_info
+        .as_ref()
         .ok_or_else(|| AppError::BadRequest("Not matched yet".into()))?;
     let room_id = info.room_id.clone();
     drop(entry); // release the dashmap borrow before the next iter
 
     // Find the OTHER player in the same room
-    let peer_relayed = state.queue.iter()
+    let peer_relayed = state
+        .queue
+        .iter()
         .find(|e| {
             e.discord_id != claims.sub
                 && e.match_info.as_ref().map(|m| &m.room_id) == Some(&room_id)
         })
         .and_then(|e| e.relayed_addr.clone());
 
-    Ok(Json(PeerRelayResponse { peer_relayed_addr: peer_relayed }))
+    Ok(Json(PeerRelayResponse {
+        peer_relayed_addr: peer_relayed,
+    }))
 }
 
 // ── Signal stubs (kept for future ICE support) ───────────────────────────────
@@ -317,23 +390,31 @@ pub async fn peer_relay(
 pub async fn signal_offer(
     State(_): State<AppState>,
     TypedHeader(_): TypedHeader<Authorization<Bearer>>,
-) -> Result<Json<serde_json::Value>, AppError> { Ok(Json(json!({ "ok": true }))) }
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(json!({ "ok": true })))
+}
 
 pub async fn signal_answer(
     State(_): State<AppState>,
     TypedHeader(_): TypedHeader<Authorization<Bearer>>,
-) -> Result<Json<serde_json::Value>, AppError> { Ok(Json(json!({ "ok": true }))) }
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(json!({ "ok": true })))
+}
 
 pub async fn signal_candidate(
     State(_): State<AppState>,
     TypedHeader(_): TypedHeader<Authorization<Bearer>>,
-) -> Result<Json<serde_json::Value>, AppError> { Ok(Json(json!({ "ok": true }))) }
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(json!({ "ok": true })))
+}
 
 pub async fn signal_poll(
     State(_): State<AppState>,
     TypedHeader(_): TypedHeader<Authorization<Bearer>>,
     Path(_): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> { Ok(Json(json!({ "candidates": [] }))) }
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(json!({ "candidates": [] })))
+}
 
 // ── POST /match/result ─────────────────────────────────────────────────────
 //
@@ -361,14 +442,20 @@ pub async fn match_result(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
 
-    let entry = state.queue.get(&req.session_id)
+    let entry = state
+        .queue
+        .get(&req.session_id)
         .ok_or_else(|| AppError::NotFound("Session not found".into()))?;
 
     if entry.discord_id != claims.sub {
-        return Err(AppError::Unauthorized("Session does not belong to you".into()));
+        return Err(AppError::Unauthorized(
+            "Session does not belong to you".into(),
+        ));
     }
 
-    let info = entry.match_info.as_ref()
+    let info = entry
+        .match_info
+        .as_ref()
         .ok_or_else(|| AppError::BadRequest("Match not yet started".into()))?;
     let room_id = info.room_id.clone();
     let own_role = info.role.clone();
@@ -396,46 +483,59 @@ pub async fn match_result(
                 "[result] mismatch — room={} reporter1={} ({}-{}) reporter2={} ({}-{}). \
                  Rejecting both. Possible cheating attempt or genuine GGRS desync.",
                 room_id,
-                pending.reporter_discord_id, pending.p1_score, pending.p2_score,
-                own_discord_id, req.p1_score, req.p2_score,
+                pending.reporter_discord_id,
+                pending.p1_score,
+                pending.p2_score,
+                own_discord_id,
+                req.p1_score,
+                req.p2_score,
             );
             // Capture an incident before we drop the pending entry. The
             // bucket record is the only persistent trace once the in-memory
             // queue/pending state is reaped — without it the warn! above
             // is the entire investigation surface.
-            record_server_incident(&state, ServerIncident {
-                kind: "score_mismatch".into(),
-                summary: format!(
-                    "{} reported {}-{}; {} reported {}-{}",
-                    pending.reporter_discord_id, pending.p1_score, pending.p2_score,
-                    own_discord_id, req.p1_score, req.p2_score,
-                ),
-                room_id: room_id.clone(),
-                session_ids: vec![req.session_id.clone()],
-                usernames: vec![own_username.clone()],
-                details: serde_json::json!({
-                    "first_reporter_discord_id": pending.reporter_discord_id,
-                    "first_reporter_p1": pending.p1_score,
-                    "first_reporter_p2": pending.p2_score,
-                    "second_reporter_discord_id": own_discord_id,
-                    "second_reporter_p1": req.p1_score,
-                    "second_reporter_p2": req.p2_score,
-                    "first_reported_at": pending.reported_at.to_rfc3339(),
-                    "rom_hash": rom_hash,
-                }),
-            });
+            record_server_incident(
+                &state,
+                ServerIncident {
+                    kind: "score_mismatch".into(),
+                    summary: format!(
+                        "{} reported {}-{}; {} reported {}-{}",
+                        pending.reporter_discord_id,
+                        pending.p1_score,
+                        pending.p2_score,
+                        own_discord_id,
+                        req.p1_score,
+                        req.p2_score,
+                    ),
+                    room_id: room_id.clone(),
+                    session_ids: vec![req.session_id.clone()],
+                    usernames: vec![own_username.clone()],
+                    details: serde_json::json!({
+                        "first_reporter_discord_id": pending.reporter_discord_id,
+                        "first_reporter_p1": pending.p1_score,
+                        "first_reporter_p2": pending.p2_score,
+                        "second_reporter_discord_id": own_discord_id,
+                        "second_reporter_p1": req.p1_score,
+                        "second_reporter_p2": req.p2_score,
+                        "first_reported_at": pending.reported_at.to_rfc3339(),
+                        "rom_hash": rom_hash,
+                    }),
+                },
+            );
             // Drop the pending entry. Whoever reports next is treated as a
             // first-time reporter — but with a logged-cheat-attempt trail.
             state.pending_results.remove(&room_id);
             return Err(AppError::BadRequest(
-                "Score mismatch with opponent's report — match not committed".into()
+                "Score mismatch with opponent's report — match not committed".into(),
             ));
         }
         // Both halves agree. Promote to confirmed and continue to forward.
         state.pending_results.remove(&room_id);
         state.confirmed_results.insert(
             room_id.clone(),
-            ConfirmedResult { committed_at: Utc::now() },
+            ConfirmedResult {
+                committed_at: Utc::now(),
+            },
         );
     } else {
         // First report — stash and wait for the partner. The TTL sweeper
@@ -451,26 +551,35 @@ pub async fn match_result(
         );
         tracing::debug!(
             "[result] pending — room={} reporter={} ({}-{}). Awaiting partner.",
-            room_id, own_discord_id, req.p1_score, req.p2_score,
+            room_id,
+            own_discord_id,
+            req.p1_score,
+            req.p2_score,
         );
-        return Ok(Json(json!({ "ok": true, "pending_partner_confirmation": true })));
+        return Ok(Json(
+            json!({ "ok": true, "pending_partner_confirmation": true }),
+        ));
     }
 
     // Find the opponent's entry in the same room (for usernames + roles).
-    let (opp_discord_id, opp_role, opp_username) = state.queue.iter()
+    let (opp_discord_id, opp_role, opp_username) = state
+        .queue
+        .iter()
         .find(|e| {
             e.discord_id != own_discord_id
                 && e.match_info.as_ref().map(|m| &m.room_id) == Some(&room_id)
         })
         .map(|e| {
-            (e.discord_id.clone(),
-             e.match_info.as_ref().map(|m| m.role.clone()),
-             e.username.clone())
+            (
+                e.discord_id.clone(),
+                e.match_info.as_ref().map(|m| m.role.clone()),
+                e.username.clone(),
+            )
         })
         .ok_or_else(|| AppError::BadRequest("Opponent not found in queue".into()))?;
 
-    let opp_role = opp_role
-        .ok_or_else(|| AppError::BadRequest("Opponent match info missing".into()))?;
+    let opp_role =
+        opp_role.ok_or_else(|| AppError::BadRequest("Opponent match info missing".into()))?;
 
     // Determine winner. Host = P1 in RAM (local_handle 0), Join = P2.
     let (host_id, join_id) = match (&own_role, &opp_role) {
@@ -481,19 +590,54 @@ pub async fn match_result(
 
     let host_won = req.p1_score > req.p2_score;
 
-    let (winner_id, loser_id, winner_score, loser_score, winner_username, loser_username) = if host_won {
-        let w_username = if own_role == PlayerRole::Host { own_username.clone() } else { opp_username.clone() };
-        let l_username = if own_role == PlayerRole::Host { opp_username.clone() } else { own_username.clone() };
-        (host_id.clone(), join_id.clone(), req.p1_score, req.p2_score, w_username, l_username)
-    } else {
-        let w_username = if own_role == PlayerRole::Join { own_username.clone() } else { opp_username.clone() };
-        let l_username = if own_role == PlayerRole::Join { opp_username.clone() } else { own_username.clone() };
-        (join_id.clone(), host_id.clone(), req.p2_score, req.p1_score, w_username, l_username)
-    };
+    let (winner_id, loser_id, winner_score, loser_score, winner_username, loser_username) =
+        if host_won {
+            let w_username = if own_role == PlayerRole::Host {
+                own_username.clone()
+            } else {
+                opp_username.clone()
+            };
+            let l_username = if own_role == PlayerRole::Host {
+                opp_username.clone()
+            } else {
+                own_username.clone()
+            };
+            (
+                host_id.clone(),
+                join_id.clone(),
+                req.p1_score,
+                req.p2_score,
+                w_username,
+                l_username,
+            )
+        } else {
+            let w_username = if own_role == PlayerRole::Join {
+                own_username.clone()
+            } else {
+                opp_username.clone()
+            };
+            let l_username = if own_role == PlayerRole::Join {
+                opp_username.clone()
+            } else {
+                own_username.clone()
+            };
+            (
+                join_id.clone(),
+                host_id.clone(),
+                req.p2_score,
+                req.p1_score,
+                w_username,
+                l_username,
+            )
+        };
 
     tracing::info!(
         "Match result: {} beat {} {}:{} (room={})",
-        winner_id, loser_id, winner_score, loser_score, room_id
+        winner_id,
+        loser_id,
+        winner_score,
+        loser_score,
+        room_id
     );
 
     // Forward to stats service if configured. Retry with backoff on transient
@@ -533,7 +677,8 @@ async fn forward_to_stats_with_retry(
     const BACKOFFS_SECS: [u64; 4] = [1, 3, 8, 20];
 
     for attempt in 0..5usize {
-        match state.http
+        match state
+            .http
             .post(url)
             .header("Authorization", format!("Bearer {api_key}"))
             .json(payload)
@@ -549,19 +694,23 @@ async fn forward_to_stats_with_retry(
                 if status.is_client_error() {
                     tracing::error!(
                         "Stats service rejected match (room={}): {} — not retrying (4xx)",
-                        payload.room_id, status,
+                        payload.room_id,
+                        status,
                     );
                     return;
                 }
                 tracing::warn!(
                     "Stats service returned {} (attempt {}/5, room={})",
-                    status, attempt + 1, payload.room_id,
+                    status,
+                    attempt + 1,
+                    payload.room_id,
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     "Stats forward error (attempt {}/5, room={}): {e}",
-                    attempt + 1, payload.room_id,
+                    attempt + 1,
+                    payload.room_id,
                 );
             }
         }
@@ -598,31 +747,42 @@ pub async fn create_room(
     let creator_session_id = Uuid::new_v4().to_string();
 
     // Register the room so someone can join it
-    state.spar_rooms.insert(room_id.clone(), SparRoom {
-        room_id: room_id.clone(),
-        creator_discord_id: claims.sub.clone(),
-        creator_username: claims.username.clone(),
-        created_at: Utc::now(),
-    });
+    state.spar_rooms.insert(
+        room_id.clone(),
+        SparRoom {
+            room_id: room_id.clone(),
+            creator_discord_id: claims.sub.clone(),
+            creator_username: claims.username.clone(),
+            created_at: Utc::now(),
+        },
+    );
 
     // Create a placeholder queue entry so the creator can poll /match/status
-    state.queue.insert(creator_session_id.clone(), QueueEntry {
-        session_id: creator_session_id.clone(),
-        discord_id: claims.sub.clone(),
-        username: claims.username.clone(),
-        stun_endpoint: req.stun_endpoint, // shared with joiner on match
-        app_version: req.app_version,
-        rom_hash: req.rom_hash,
-        queued_at: Utc::now(),
-        match_info: None,
-        cancelled: false,
-        relayed_addr: None,
-    });
+    state.queue.insert(
+        creator_session_id.clone(),
+        QueueEntry {
+            session_id: creator_session_id.clone(),
+            discord_id: claims.sub.clone(),
+            username: claims.username.clone(),
+            stun_endpoint: req.stun_endpoint, // shared with joiner on match
+            app_version: req.app_version,
+            rom_hash: req.rom_hash,
+            queued_at: Utc::now(),
+            match_info: None,
+            cancelled: false,
+            relayed_addr: None,
+        },
+    );
 
-    state.player_sessions.insert(claims.sub.clone(), creator_session_id.clone());
+    state
+        .player_sessions
+        .insert(claims.sub.clone(), creator_session_id.clone());
 
     tracing::info!("Room {} created by {}", room_id, claims.username);
-    Ok(Json(CreateRoomResponse { room_id, creator_session_id }))
+    Ok(Json(CreateRoomResponse {
+        room_id,
+        creator_session_id,
+    }))
 }
 
 // ── POST /room/join/:room_id ───────────────────────────────────────────────────
@@ -643,7 +803,9 @@ pub async fn join_room(
     }
 
     // Find and consume the room — atomically remove so it can't be joined twice
-    let room = state.spar_rooms.remove(&room_id)
+    let room = state
+        .spar_rooms
+        .remove(&room_id)
         .map(|(_, r)| r)
         .ok_or_else(|| AppError::NotFound("Room not found or already joined".into()))?;
 
@@ -652,7 +814,9 @@ pub async fn join_room(
     }
 
     // Find the creator's queue entry
-    let creator_session_id = state.player_sessions.get(&room.creator_discord_id)
+    let creator_session_id = state
+        .player_sessions
+        .get(&room.creator_discord_id)
         .map(|s| s.clone())
         .ok_or_else(|| AppError::NotFound("Room creator is no longer available".into()))?;
 
@@ -660,7 +824,9 @@ pub async fn join_room(
         return Err(AppError::NotFound("Room creator session expired".into()));
     };
     if creator_entry.cancelled || creator_entry.match_info.is_some() {
-        return Err(AppError::NotFound("Room creator is no longer in queue".into()));
+        return Err(AppError::NotFound(
+            "Room creator is no longer in queue".into(),
+        ));
     }
 
     let joiner_session_id = Uuid::new_v4().to_string();
@@ -683,33 +849,46 @@ pub async fn join_room(
     });
 
     // Create joiner's entry: they are Join
-    state.queue.insert(joiner_session_id.clone(), QueueEntry {
-        session_id: joiner_session_id.clone(),
-        discord_id: claims.sub.clone(),
-        username: claims.username.clone(),
-        stun_endpoint: req.stun_endpoint.clone(),
-        app_version: req.app_version.clone(),
-        rom_hash: req.rom_hash.clone(),
-        queued_at: Utc::now(),
-        match_info: Some(MatchInfo {
-            role: PlayerRole::Join,
-            peer_endpoint: creator_stun.clone(),
-            punch_at_ms,
-            room_id: match_room_id.clone(),
-            username: room.creator_username.clone(),
-            turn: join_creds.clone(),
-        }),
-        cancelled: false,
-        relayed_addr: None,
-    });
+    state.queue.insert(
+        joiner_session_id.clone(),
+        QueueEntry {
+            session_id: joiner_session_id.clone(),
+            discord_id: claims.sub.clone(),
+            username: claims.username.clone(),
+            stun_endpoint: req.stun_endpoint.clone(),
+            app_version: req.app_version.clone(),
+            rom_hash: req.rom_hash.clone(),
+            queued_at: Utc::now(),
+            match_info: Some(MatchInfo {
+                role: PlayerRole::Join,
+                peer_endpoint: creator_stun.clone(),
+                punch_at_ms,
+                room_id: match_room_id.clone(),
+                username: room.creator_username.clone(),
+                turn: join_creds.clone(),
+            }),
+            cancelled: false,
+            relayed_addr: None,
+        },
+    );
 
-    state.player_sessions.insert(claims.sub.clone(), joiner_session_id.clone());
+    state
+        .player_sessions
+        .insert(claims.sub.clone(), joiner_session_id.clone());
 
-    let (s, u1, u2) = (state.clone(), room.creator_username.clone(), claims.username.clone());
+    let (s, u1, u2) = (
+        state.clone(),
+        room.creator_username.clone(),
+        claims.username.clone(),
+    );
     tokio::spawn(async move { discord::notify_matched(&s, &u1, &u2).await });
 
-    tracing::info!("Room {} joined: {} (creator) vs {} (joiner)",
-        room_id, room.creator_username, claims.username);
+    tracing::info!(
+        "Room {} joined: {} (creator) vs {} (joiner)",
+        room_id,
+        room.creator_username,
+        claims.username
+    );
 
     Ok(Json(JoinRoomResponse {
         session_id: joiner_session_id,
@@ -744,24 +923,37 @@ pub async fn spectator_push(
     // for it. We do this here rather than at route level so the lookup is
     // close to the use; a single read of the queue entry is enough.
     {
-        let entry = state.queue.get(&session_id)
+        let entry = state
+            .queue
+            .get(&session_id)
             .ok_or_else(|| AppError::NotFound("Session not found".into()))?;
         if entry.discord_id != claims.sub {
-            return Err(AppError::Unauthorized("Session does not belong to you".into()));
+            return Err(AppError::Unauthorized(
+                "Session does not belong to you".into(),
+            ));
         }
     }
 
     // Read player names from the queue entry
     let (p1_username, p2_username) = if let Some(entry) = state.queue.get(&session_id) {
         let p1 = entry.username.clone();
-        // Find opponent's entry sharing the same room_id
-        let room_id = entry.match_info.as_ref().map(|m| m.room_id.clone()).unwrap_or_default();
-        let p2 = state.queue.iter()
+        let own_discord_id = entry.discord_id.clone();
+        // Find opponent's entry sharing the same room_id.
+        let room_id = entry
+            .match_info
+            .as_ref()
+            .map(|m| m.room_id.clone())
+            .unwrap_or_default();
+        drop(entry);
+        let p2 = state
+            .queue
+            .iter()
             .find(|e| {
-                e.match_info.as_ref()
+                e.match_info
+                    .as_ref()
                     .map(|m| m.room_id == room_id)
                     .unwrap_or(false)
-                    && e.discord_id != entry.discord_id
+                    && e.discord_id != own_discord_id
             })
             .map(|e| e.username.clone())
             .unwrap_or_else(|| "Opponent".to_string());
@@ -770,18 +962,24 @@ pub async fn spectator_push(
         ("Player 1".to_string(), "Player 2".to_string())
     };
 
-    state.spectator_frames.insert(session_id.clone(), SpectatorFrame {
-        savestate: req.savestate,
-        inputs: req.inputs,
-        frame: req.frame,
-        score_p1: req.score_p1,
-        score_p2: req.score_p2,
-        p1_username,
-        p2_username,
-        updated_at: Utc::now(),
-    });
+    state.spectator_frames.insert(
+        session_id.clone(),
+        SpectatorFrame {
+            savestate: req.savestate,
+            inputs: req.inputs,
+            frame: req.frame,
+            score_p1: req.score_p1,
+            score_p2: req.score_p2,
+            p1_username,
+            p2_username,
+            updated_at: Utc::now(),
+        },
+    );
 
-    tracing::debug!("Spectator frame pushed for session {session_id}: frame={}", req.frame);
+    tracing::debug!(
+        "Spectator frame pushed for session {session_id}: frame={}",
+        req.frame
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -819,8 +1017,14 @@ pub async fn live_matches(
 
     for entry in state.queue.iter() {
         let (sid, q) = entry.pair();
-        if q.cancelled { continue; }
-        let info = if let Some(ref info) = q.match_info { info } else { continue; };
+        if q.cancelled {
+            continue;
+        }
+        let info = if let Some(ref info) = q.match_info {
+            info
+        } else {
+            continue;
+        };
 
         // Look up the opponent's username from the match_info
         let p1_username = if info.role == PlayerRole::Host {
@@ -838,7 +1042,8 @@ pub async fn live_matches(
         // pushing), not by room_id. Check this side's first; if neither
         // side has pushed yet, the other side will when its iter pass
         // dedup'd by room_id picks it up.
-        let (score_p1, score_p2) = state.spectator_frames
+        let (score_p1, score_p2) = state
+            .spectator_frames
             .get(sid)
             .map(|f| (f.score_p1, f.score_p2))
             .unwrap_or((0, 0));

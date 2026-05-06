@@ -8,6 +8,7 @@
 # Environment / secrets — NEVER commit
 .env
 .env.local
+.incidents/
 
 # IDE
 .vscode/

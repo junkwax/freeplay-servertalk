@@ -105,6 +105,8 @@ pub struct PeerRelayResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchResultRequest {
     pub session_id: String,
+    #[serde(default)]
+    pub match_index: u32,
     pub p1_score: u16,
     pub p2_score: u16,
 }

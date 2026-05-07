@@ -418,10 +418,12 @@ pub async fn signal_poll(
 
 // ── POST /match/result ─────────────────────────────────────────────────────
 //
-// Both clients report the same synced-GGRS outcome {session_id, p1_score, p2_score}.
+// Both clients report the same synced-GGRS outcome
+// {session_id, match_index, p1_score, p2_score}.
 // P1 in the game RAM = Host (local_handle 0), P2 = Join (local_handle 1).
-// The server deduplicates by room_id, determines the winner, then forwards the
-// result to the stats service for Glicko-2 rating update + leaderboard storage.
+// The server deduplicates by room_id + match_index, determines the winner,
+// then forwards the result to the stats service for Glicko-2 rating update +
+// leaderboard storage.
 
 #[derive(Debug, Serialize)]
 struct StatsForward {
@@ -458,6 +460,8 @@ pub async fn match_result(
         .as_ref()
         .ok_or_else(|| AppError::BadRequest("Match not yet started".into()))?;
     let room_id = info.room_id.clone();
+    let match_index = req.match_index;
+    let result_id = format!("{room_id}#{match_index}");
     let own_role = info.role.clone();
     let own_discord_id = entry.discord_id.clone();
     let own_username = entry.username.clone();
@@ -468,21 +472,21 @@ pub async fn match_result(
     // The first poster lands in `pending_results`; the second one validates
     // and graduates the pair into `confirmed_results`. Without this check
     // either client can unilaterally report any score and farm rating.
-    if state.confirmed_results.contains_key(&room_id) {
+    if state.confirmed_results.contains_key(&result_id) {
         return Ok(Json(json!({ "ok": true, "already_recorded": true })));
     }
 
     // Pending phase: have we seen the first half of this match's report?
-    if let Some(pending) = state.pending_results.get(&room_id).map(|p| p.clone()) {
+    if let Some(pending) = state.pending_results.get(&result_id).map(|p| p.clone()) {
         if pending.reporter_discord_id == own_discord_id {
             // Same client reporting again. Idempotent — accept silently.
             return Ok(Json(json!({ "ok": true, "duplicate_self_report": true })));
         }
         if pending.p1_score != req.p1_score || pending.p2_score != req.p2_score {
             tracing::warn!(
-                "[result] mismatch — room={} reporter1={} ({}-{}) reporter2={} ({}-{}). \
+                "[result] mismatch — result={} reporter1={} ({}-{}) reporter2={} ({}-{}). \
                  Rejecting both. Possible cheating attempt or genuine GGRS desync.",
-                room_id,
+                result_id,
                 pending.reporter_discord_id,
                 pending.p1_score,
                 pending.p2_score,
@@ -511,6 +515,8 @@ pub async fn match_result(
                     session_ids: vec![req.session_id.clone()],
                     usernames: vec![own_username.clone()],
                     details: serde_json::json!({
+                        "result_id": result_id,
+                        "match_index": match_index,
                         "first_reporter_discord_id": pending.reporter_discord_id,
                         "first_reporter_p1": pending.p1_score,
                         "first_reporter_p2": pending.p2_score,
@@ -524,15 +530,15 @@ pub async fn match_result(
             );
             // Drop the pending entry. Whoever reports next is treated as a
             // first-time reporter — but with a logged-cheat-attempt trail.
-            state.pending_results.remove(&room_id);
+            state.pending_results.remove(&result_id);
             return Err(AppError::BadRequest(
                 "Score mismatch with opponent's report — match not committed".into(),
             ));
         }
         // Both halves agree. Promote to confirmed and continue to forward.
-        state.pending_results.remove(&room_id);
+        state.pending_results.remove(&result_id);
         state.confirmed_results.insert(
-            room_id.clone(),
+            result_id.clone(),
             ConfirmedResult {
                 committed_at: Utc::now(),
             },
@@ -541,7 +547,7 @@ pub async fn match_result(
         // First report — stash and wait for the partner. The TTL sweeper
         // will remove this if the partner never reports.
         state.pending_results.insert(
-            room_id.clone(),
+            result_id.clone(),
             PendingResult {
                 reporter_discord_id: own_discord_id.clone(),
                 p1_score: req.p1_score,
@@ -550,8 +556,8 @@ pub async fn match_result(
             },
         );
         tracing::debug!(
-            "[result] pending — room={} reporter={} ({}-{}). Awaiting partner.",
-            room_id,
+            "[result] pending — result={} reporter={} ({}-{}). Awaiting partner.",
+            result_id,
             own_discord_id,
             req.p1_score,
             req.p2_score,
@@ -632,12 +638,13 @@ pub async fn match_result(
         };
 
     tracing::info!(
-        "Match result: {} beat {} {}:{} (room={})",
+        "Match result: {} beat {} {}:{} (room={} match_index={})",
         winner_id,
         loser_id,
         winner_score,
         loser_score,
-        room_id
+        room_id,
+        match_index
     );
 
     // Forward to stats service if configured. Retry with backoff on transient
@@ -645,7 +652,7 @@ pub async fn match_result(
     // result. Auth errors / 4xx aren't retried — those are configuration bugs.
     if let (Some(url), Some(key)) = (&state.config.stats_service_url, &state.config.stats_api_key) {
         let payload = StatsForward {
-            room_id,
+            room_id: result_id,
             winner_id,
             loser_id,
             winner_score,

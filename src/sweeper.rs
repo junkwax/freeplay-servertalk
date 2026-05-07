@@ -121,7 +121,11 @@ fn sweep_once(state: &AppState) -> SweepCounts {
             //   Less interesting on a quiet day but worth flagging.
             if !entry.cancelled {
                 if let Some(info) = &entry.match_info {
-                    let confirmed = state.confirmed_results.contains_key(&info.room_id);
+                    let confirmed = state.confirmed_results.contains_key(&info.room_id)
+                        || state
+                            .confirmed_results
+                            .iter()
+                            .any(|r| r.key().starts_with(&format!("{}#", info.room_id)));
                     if !confirmed {
                         record_server_incident(
                             state,

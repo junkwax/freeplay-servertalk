@@ -40,10 +40,11 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub queue: Arc<DashMap<String, QueueEntry>>,
     pub player_sessions: Arc<DashMap<String, String>>,
-    /// room_id → first half of a match result, awaiting the partner's report.
+    /// result_id (`room_id#match_index`) → first half of a match result,
+    /// awaiting the partner's report.
     pub pending_results: Arc<DashMap<String, PendingResult>>,
-    /// room_id → committed result. Acts as the "already recorded" sentinel
-    /// the dedup path checks. Replaces the unit-valued match_results map.
+    /// result_id (`room_id#match_index`) → committed result. Acts as the
+    /// "already recorded" sentinel the dedup path checks.
     pub confirmed_results: Arc<DashMap<String, ConfirmedResult>>,
     pub spar_rooms: Arc<DashMap<String, SparRoom>>,
     /// session_id → latest spectator frame pushed by a playing peer

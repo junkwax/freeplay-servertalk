@@ -16,6 +16,11 @@ pub struct Config {
     // Stats service — forwards match results for Glicko-2 ranking / leaderboards
     pub stats_service_url: Option<String>,
     pub stats_api_key: Option<String>,
+
+    // Optional GitHub issue publisher for incident reports. Keep the token
+    // server-side; public clients only upload incidents to this service.
+    pub github_issues_repo: Option<String>,
+    pub github_issues_token: Option<String>,
 }
 
 impl Config {
@@ -28,14 +33,14 @@ impl Config {
             discord_webhook_url: std::env::var("DISCORD_WEBHOOK_URL").ok(),
             discord_redirect_uri: std::env::var("DISCORD_REDIRECT_URI")
                 .unwrap_or_else(|_| "http://localhost:8080/auth/discord/callback".to_string()),
-            jwt_secret: std::env::var("JWT_SECRET")
-                .context("JWT_SECRET not set")?,
+            jwt_secret: std::env::var("JWT_SECRET").context("JWT_SECRET not set")?,
             turn_server_ip: std::env::var("TURN_SERVER_IP").ok(),
             turn_shared_secret: std::env::var("TURN_SHARED_SECRET").ok(),
-            turn_realm: std::env::var("TURN_REALM")
-                .unwrap_or_else(|_| "example.com".to_string()),
+            turn_realm: std::env::var("TURN_REALM").unwrap_or_else(|_| "example.com".to_string()),
             stats_service_url: std::env::var("STATS_SERVICE_URL").ok(),
             stats_api_key: std::env::var("STATS_API_KEY").ok(),
+            github_issues_repo: std::env::var("GITHUB_ISSUES_REPO").ok(),
+            github_issues_token: std::env::var("GITHUB_ISSUES_TOKEN").ok(),
         })
     }
 

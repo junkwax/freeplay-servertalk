@@ -46,7 +46,8 @@ pub fn mint_credentials(
     let username = format!("{}:{}:{}", role, expiry, room_id);
 
     // HMAC the same payload with sha256 → hex.
-    let secret_bytes = hex_decode(shared_secret).unwrap_or_else(|| shared_secret.as_bytes().to_vec());
+    let secret_bytes =
+        hex_decode(shared_secret).unwrap_or_else(|| shared_secret.as_bytes().to_vec());
     let mut mac = HmacSha256::new_from_slice(&secret_bytes).expect("hmac accepts any key");
     mac.update(username.as_bytes());
     let tag = mac.finalize().into_bytes();

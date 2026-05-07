@@ -11,6 +11,8 @@
 #   JWT_SECRET=...                    (optional — auto-generated if missing)
 #   STATS_SERVICE_URL=...             (optional — stats service /results URL)
 #   STATS_API_KEY=...                 (optional — matches STATS_API_KEY on stats service)
+#   GITHUB_ISSUES_REPO=owner/repo     (optional — auto-open/update incident issues)
+#   GITHUB_ISSUES_TOKEN=ghp_...       (optional — fine-grained token with Issues write)
 
 set -euo pipefail
 
@@ -46,6 +48,8 @@ fi
 DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
 STATS_SERVICE_URL="${STATS_SERVICE_URL:-}"
 STATS_API_KEY="${STATS_API_KEY:-}"
+GITHUB_ISSUES_REPO="${GITHUB_ISSUES_REPO:-}"
+GITHUB_ISSUES_TOKEN="${GITHUB_ISSUES_TOKEN:-}"
 
 echo "================================================================"
 echo "Project: ${PROJECT_ID} | Region: ${REGION} | Service: ${SERVICE_NAME}"
@@ -204,8 +208,28 @@ elif gcloud secrets describe STATS_API_KEY --project="${PROJECT_ID}" &>/dev/null
   SECRETS_LIST="${SECRETS_LIST},STATS_API_KEY=STATS_API_KEY:latest"
 fi
 
+if [ -n "${GITHUB_ISSUES_TOKEN}" ]; then
+  create_secret "GITHUB_ISSUES_TOKEN" "${GITHUB_ISSUES_TOKEN}"
+  gcloud secrets add-iam-policy-binding "GITHUB_ISSUES_TOKEN" \
+    --member="serviceAccount:${COMPUTE_SA}" \
+    --role="roles/secretmanager.secretAccessor" \
+    --project="${PROJECT_ID}" \
+    --condition=None \
+    >/dev/null 2>&1 || true
+  SECRETS_LIST="${SECRETS_LIST},GITHUB_ISSUES_TOKEN=GITHUB_ISSUES_TOKEN:latest"
+elif gcloud secrets describe GITHUB_ISSUES_TOKEN --project="${PROJECT_ID}" &>/dev/null; then
+  SECRETS_LIST="${SECRETS_LIST},GITHUB_ISSUES_TOKEN=GITHUB_ISSUES_TOKEN:latest"
+fi
+
 if [ -n "${STATS_SERVICE_URL}" ]; then
   ENV_VARS="STATS_SERVICE_URL=${STATS_SERVICE_URL}"
+fi
+if [ -n "${GITHUB_ISSUES_REPO}" ]; then
+  if [ -n "${ENV_VARS}" ]; then
+    ENV_VARS="${ENV_VARS},GITHUB_ISSUES_REPO=${GITHUB_ISSUES_REPO}"
+  else
+    ENV_VARS="GITHUB_ISSUES_REPO=${GITHUB_ISSUES_REPO}"
+  fi
 fi
 
 DEPLOY_ARGS=(

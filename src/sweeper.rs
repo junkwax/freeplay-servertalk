@@ -9,8 +9,8 @@
 //! horizon, with one extra buffer on top for clock skew between the
 //! signaling server and the clients.
 
-use std::time::Duration;
 use chrono::Utc;
+use std::time::Duration;
 
 use crate::incidents::{record_server_incident, ServerIncident};
 use crate::state::AppState;
@@ -93,7 +93,8 @@ fn sweep_once(state: &AppState) -> SweepCounts {
     // queue: cancelled or stale-by-age. We collect keys first, then remove,
     // because dashmap's retain-while-iter would deadlock on shard locks held
     // by concurrent /match/lfg or /match/status callers.
-    let stale: Vec<String> = state.queue
+    let stale: Vec<String> = state
+        .queue
         .iter()
         .filter_map(|e| {
             let age = (now - e.queued_at).num_seconds();
@@ -122,57 +123,67 @@ fn sweep_once(state: &AppState) -> SweepCounts {
                 if let Some(info) = &entry.match_info {
                     let confirmed = state.confirmed_results.contains_key(&info.room_id);
                     if !confirmed {
-                        record_server_incident(state, ServerIncident {
-                            kind: "matched_no_result".into(),
+                        record_server_incident(
+                            state,
+                            ServerIncident {
+                                kind: "matched_no_result".into(),
+                                summary: format!(
+                                    "Match {} between {} and {} reaped after {}s with no result",
+                                    info.room_id,
+                                    entry.username,
+                                    info.username,
+                                    (now - entry.queued_at).num_seconds(),
+                                ),
+                                room_id: info.room_id.clone(),
+                                session_ids: vec![entry.session_id.clone()],
+                                usernames: vec![entry.username.clone(), info.username.clone()],
+                                details: serde_json::json!({
+                                    "role": format!("{:?}", info.role),
+                                    "peer_endpoint": info.peer_endpoint,
+                                    "punch_at_ms": info.punch_at_ms,
+                                    "had_turn_creds": info.turn.is_some(),
+                                    "rom_hash": entry.rom_hash,
+                                    "app_version": entry.app_version,
+                                    "queued_at": entry.queued_at.to_rfc3339(),
+                                    "reaped_at": now.to_rfc3339(),
+                                }),
+                            },
+                        );
+                    }
+                } else {
+                    record_server_incident(
+                        state,
+                        ServerIncident {
+                            kind: "lfg_no_pair".into(),
                             summary: format!(
-                                "Match {} between {} and {} reaped after {}s with no result",
-                                info.room_id,
+                                "{} sat in queue {}s without finding a partner (rom={}, app={})",
                                 entry.username,
-                                info.username,
                                 (now - entry.queued_at).num_seconds(),
+                                entry.rom_hash,
+                                entry.app_version,
                             ),
-                            room_id: info.room_id.clone(),
+                            room_id: String::new(),
                             session_ids: vec![entry.session_id.clone()],
-                            usernames: vec![entry.username.clone(), info.username.clone()],
+                            usernames: vec![entry.username.clone()],
                             details: serde_json::json!({
-                                "role": format!("{:?}", info.role),
-                                "peer_endpoint": info.peer_endpoint,
-                                "punch_at_ms": info.punch_at_ms,
-                                "had_turn_creds": info.turn.is_some(),
                                 "rom_hash": entry.rom_hash,
                                 "app_version": entry.app_version,
+                                "stun_endpoint": entry.stun_endpoint,
                                 "queued_at": entry.queued_at.to_rfc3339(),
                                 "reaped_at": now.to_rfc3339(),
                             }),
-                        });
-                    }
-                } else {
-                    record_server_incident(state, ServerIncident {
-                        kind: "lfg_no_pair".into(),
-                        summary: format!(
-                            "{} sat in queue {}s without finding a partner (rom={}, app={})",
-                            entry.username,
-                            (now - entry.queued_at).num_seconds(),
-                            entry.rom_hash,
-                            entry.app_version,
-                        ),
-                        room_id: String::new(),
-                        session_ids: vec![entry.session_id.clone()],
-                        usernames: vec![entry.username.clone()],
-                        details: serde_json::json!({
-                            "rom_hash": entry.rom_hash,
-                            "app_version": entry.app_version,
-                            "stun_endpoint": entry.stun_endpoint,
-                            "queued_at": entry.queued_at.to_rfc3339(),
-                            "reaped_at": now.to_rfc3339(),
-                        }),
-                    });
+                        },
+                    );
                 }
             }
 
             // If this player still has us as their session pointer, drop it.
             // Avoids a future LFG seeing a "stuck" session_id.
-            if let Some(sid) = state.player_sessions.get(&entry.discord_id).map(|s| s.clone()) {
+            if let Some(sid) = state
+                .player_sessions
+                .get(&entry.discord_id)
+                .map(|s| s.clone())
+            {
                 if sid == key {
                     state.player_sessions.remove(&entry.discord_id);
                 }
@@ -181,7 +192,8 @@ fn sweep_once(state: &AppState) -> SweepCounts {
         }
     }
 
-    let stale: Vec<String> = state.spar_rooms
+    let stale: Vec<String> = state
+        .spar_rooms
         .iter()
         .filter_map(|e| {
             if (now - e.created_at).num_seconds() > SPAR_ROOM_TTL_SECS {
@@ -197,7 +209,8 @@ fn sweep_once(state: &AppState) -> SweepCounts {
         }
     }
 
-    let stale: Vec<String> = state.confirmed_results
+    let stale: Vec<String> = state
+        .confirmed_results
         .iter()
         .filter_map(|e| {
             if (now - e.committed_at).num_seconds() > CONFIRMED_RESULT_TTL_SECS {
@@ -213,7 +226,8 @@ fn sweep_once(state: &AppState) -> SweepCounts {
         }
     }
 
-    let stale: Vec<String> = state.pending_results
+    let stale: Vec<String> = state
+        .pending_results
         .iter()
         .filter_map(|e| {
             if (now - e.reported_at).num_seconds() > PENDING_RESULT_TTL_SECS {
@@ -229,7 +243,8 @@ fn sweep_once(state: &AppState) -> SweepCounts {
         }
     }
 
-    let stale: Vec<String> = state.spectator_frames
+    let stale: Vec<String> = state
+        .spectator_frames
         .iter()
         .filter_map(|e| {
             if (now - e.updated_at).num_seconds() > SPECTATOR_FRAME_TTL_SECS {
@@ -245,7 +260,8 @@ fn sweep_once(state: &AppState) -> SweepCounts {
         }
     }
 
-    let stale: Vec<String> = state.oauth_states
+    let stale: Vec<String> = state
+        .oauth_states
         .iter()
         .filter_map(|e| {
             if (now - e.issued_at).num_seconds() > OAUTH_STATE_TTL_SECS {

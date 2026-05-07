@@ -18,7 +18,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -119,7 +119,9 @@ pub struct StoredIncident {
 /// log the error server-side; the bucket's job is best-effort capture.
 pub async fn submit_incident(
     state: axum::extract::State<AppState>,
-    auth: axum_extra::TypedHeader<axum_extra::headers::Authorization<axum_extra::headers::authorization::Bearer>>,
+    auth: axum_extra::TypedHeader<
+        axum_extra::headers::Authorization<axum_extra::headers::authorization::Bearer>,
+    >,
     body: axum::Json<IncidentRequest>,
 ) -> Result<axum::Json<serde_json::Value>, crate::error::AppError> {
     let claims = crate::auth::verify_token(auth.token(), &state.config.jwt_secret)?;
@@ -143,13 +145,28 @@ pub async fn submit_incident(
     // already a failure cleanup path.
     let state = state.0.clone();
     tokio::spawn(async move {
-        if let Err(e) = upload_incident(&state, &stored).await {
-            tracing::error!(
-                "[incident] upload failed (kind={}, room={}): {}",
-                stored.payload.get("kind").and_then(|v| v.as_str()).unwrap_or("?"),
-                stored.payload.get("room_id").and_then(|v| v.as_str()).unwrap_or("?"),
-                e,
-            );
+        match upload_incident(&state, &stored).await {
+            Ok(object_name) => {
+                if let Err(e) = publish_github_issue(&state, &stored, &object_name).await {
+                    tracing::warn!("[incident] github issue publish failed: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[incident] upload failed (kind={}, room={}): {}",
+                    stored
+                        .payload
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?"),
+                    stored
+                        .payload
+                        .get("room_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?"),
+                    e,
+                );
+            }
         }
     });
 
@@ -173,8 +190,15 @@ pub fn record_server_incident(state: &AppState, incident: ServerIncident) {
     };
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = upload_incident(&state, &stored).await {
-            tracing::error!("[incident] server upload failed: {}", e);
+        match upload_incident(&state, &stored).await {
+            Ok(object_name) => {
+                if let Err(e) = publish_github_issue(&state, &stored, &object_name).await {
+                    tracing::warn!("[incident] server github issue publish failed: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::error!("[incident] server upload failed: {}", e);
+            }
         }
     });
 }
@@ -195,7 +219,7 @@ fn truncate_field(s: &mut String, max_bytes: usize) {
     *s = format!("[truncated {} bytes from front]\n{}", start, kept);
 }
 
-async fn upload_incident(state: &AppState, incident: &StoredIncident) -> anyhow::Result<()> {
+async fn upload_incident(state: &AppState, incident: &StoredIncident) -> anyhow::Result<String> {
     let token = fetch_metadata_token(&state.http).await?;
 
     let date = incident.recorded_at;
@@ -214,7 +238,8 @@ async fn upload_incident(state: &AppState, incident: &StoredIncident) -> anyhow:
         urlencoding::encode(&object_name),
     );
 
-    let resp = state.http
+    let resp = state
+        .http
         .post(&url)
         .bearer_auth(&token)
         .header("Content-Type", "application/json")
@@ -230,10 +255,264 @@ async fn upload_incident(state: &AppState, incident: &StoredIncident) -> anyhow:
     tracing::info!(
         "[incident] uploaded {} (kind={}, origin={})",
         object_name,
-        incident.payload.get("kind").and_then(|v| v.as_str()).unwrap_or("?"),
+        incident
+            .payload
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?"),
         incident.origin,
     );
+    Ok(object_name)
+}
+
+async fn publish_github_issue(
+    state: &AppState,
+    incident: &StoredIncident,
+    object_name: &str,
+) -> anyhow::Result<()> {
+    let Some(repo) = state.config.github_issues_repo.as_deref() else {
+        return Ok(());
+    };
+    let Some(token) = state.config.github_issues_token.as_deref() else {
+        return Ok(());
+    };
+
+    let fingerprint = incident_fingerprint(incident);
+    let title = incident_title(incident);
+    let body = incident_issue_body(incident, object_name, &fingerprint);
+
+    if let Some(issue) = find_open_issue(state, repo, token, &fingerprint).await? {
+        let comment = format!(
+            "Another matching incident arrived.\n\n- Incident: `{}`\n- Bucket object: `gs://{}/{}`\n- Recorded: `{}`",
+            incident.incident_id,
+            BUCKET,
+            object_name,
+            incident.recorded_at.to_rfc3339(),
+        );
+        let url = format!(
+            "https://api.github.com/repos/{}/issues/{}/comments",
+            repo, issue.number,
+        );
+        state
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "freeplay-signaling-server")
+            .json(&json!({ "body": comment }))
+            .send()
+            .await?
+            .error_for_status()?;
+        tracing::info!(
+            "[incident] appended github issue #{} for fingerprint {}",
+            issue.number,
+            fingerprint,
+        );
+        return Ok(());
+    }
+
+    let url = format!("https://api.github.com/repos/{}/issues", repo);
+    state
+        .http
+        .post(url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "freeplay-signaling-server")
+        .json(&json!({
+            "title": title,
+            "body": body,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    tracing::info!(
+        "[incident] created github issue for fingerprint {}",
+        fingerprint
+    );
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct IssueSearch {
+    items: Vec<IssueSearchItem>,
+}
+
+#[derive(Deserialize)]
+struct IssueSearchItem {
+    number: u64,
+}
+
+async fn find_open_issue(
+    state: &AppState,
+    repo: &str,
+    token: &str,
+    fingerprint: &str,
+) -> anyhow::Result<Option<IssueSearchItem>> {
+    let query = format!("repo:{} is:issue is:open {}", repo, fingerprint);
+    let url = format!(
+        "https://api.github.com/search/issues?q={}",
+        urlencoding::encode(&query),
+    );
+    let resp = state
+        .http
+        .get(url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "freeplay-signaling-server")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("github issue search {}: {}", status, text);
+    }
+    let found: IssueSearch = resp.json().await?;
+    Ok(found.items.into_iter().next())
+}
+
+fn incident_title(incident: &StoredIncident) -> String {
+    let payload = &incident.payload;
+    let kind = payload
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let version = payload
+        .get("app_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let summary = payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if version.is_empty() {
+        format!("[incident] {}: {}", kind, one_line(summary, 100))
+    } else {
+        format!(
+            "[incident] {} v{}: {}",
+            kind,
+            version,
+            one_line(summary, 90)
+        )
+    }
+}
+
+fn incident_issue_body(incident: &StoredIncident, object_name: &str, fingerprint: &str) -> String {
+    let payload = &incident.payload;
+    let kind = payload
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let summary = payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let app_version = payload
+        .get("app_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let git_hash = payload
+        .get("git_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let room_id = payload
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let session_id = payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    let frames = payload
+        .get("frames_advanced")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reporter = incident.reporter_username.as_deref().unwrap_or("server");
+
+    format!(
+        "Automated incident from freeplay signaling.\n\n\
+        - Fingerprint: `{}`\n\
+        - Kind: `{}`\n\
+        - Summary: `{}`\n\
+        - Origin: `{}`\n\
+        - Reporter: `{}`\n\
+        - Version: `{}` `{}`\n\
+        - Room: `{}`\n\
+        - Session: `{}`\n\
+        - Role: `{}`\n\
+        - Frames advanced: `{}`\n\
+        - Recorded: `{}`\n\
+        - Bucket object: `gs://{}/{}`\n\n\
+        Full client logs are intentionally kept in the private GCS incident object, not pasted into this public issue.",
+        fingerprint,
+        kind,
+        one_line(summary, 500),
+        incident.origin,
+        reporter,
+        app_version,
+        git_hash,
+        room_id,
+        session_id,
+        role,
+        frames,
+        incident.recorded_at.to_rfc3339(),
+        BUCKET,
+        object_name,
+    )
+}
+
+fn incident_fingerprint(incident: &StoredIncident) -> String {
+    let payload = &incident.payload;
+    let kind = payload
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let version = payload
+        .get("app_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("server");
+    let summary = payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    format!(
+        "freeplay-incident:{}:{}:{}",
+        sanitize_label(kind),
+        sanitize_label(version),
+        sanitize_label(&one_line(summary, 48)),
+    )
+}
+
+fn sanitize_label(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "unknown".into()
+    } else {
+        out
+    }
+}
+
+fn one_line(s: &str, max_chars: usize) -> String {
+    let mut out = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if out.chars().count() > max_chars {
+        out = out
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        out.push('…');
+    }
+    out
 }
 
 /// Fetch an OAuth2 access token from Cloud Run's metadata server.

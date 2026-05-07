@@ -1,7 +1,10 @@
-use std::sync::Arc;
+use crate::{
+    config::Config,
+    models::{QueueEntry, SparRoom, SpectatorFrame},
+};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use crate::{config::Config, models::{QueueEntry, SparRoom, SpectatorFrame}};
+use std::sync::Arc;
 
 /// One side of a not-yet-confirmed match result. We require both clients to
 /// report identical scores within a short window before committing the result;

@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         // Discord OAuth
         .route("/auth/discord", get(auth::discord_login))
         .route("/auth/discord/callback", get(auth::discord_callback))
+        .route("/auth/guest", post(auth::guest_login))
         .route("/auth/me", get(auth::me))
         // Matchmaking
         .route("/match/lfg", post(matchmaking::looking_for_game))

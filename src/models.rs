@@ -15,7 +15,16 @@ pub struct DiscordUser {
 pub struct Claims {
     pub sub: String,
     pub username: String,
+    #[serde(default)]
+    pub email: Option<String>,
     pub exp: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestAuthRequest {
+    pub username: String,
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 // ── Matchmaking ───────────────────────────────────────────────────────────────

@@ -12,9 +12,44 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    models::{Claims, DiscordUser},
+    models::{Claims, DiscordUser, GuestAuthRequest},
     state::{AppState, OAuthState},
 };
+
+pub async fn guest_login(
+    State(state): State<AppState>,
+    Json(req): Json<GuestAuthRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let username = sanitize_username(&req.username)
+        .ok_or_else(|| AppError::BadRequest("Username must be 2-24 letters/numbers".into()))?;
+    let email = req.email.as_deref().and_then(normalize_email);
+    let identity = email.as_deref().unwrap_or(&username);
+    let prefix = if email.is_some() {
+        "guest-email"
+    } else {
+        "guest-name"
+    };
+    let sub = format!("{prefix}:{}", sha256_hex(identity.as_bytes()));
+    let exp = (Utc::now() + chrono::Duration::days(30)).timestamp() as usize;
+    let claims = Claims {
+        sub,
+        username: username.clone(),
+        email,
+        exp,
+    };
+    let jwt = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(state.config.jwt_secret.as_bytes()),
+    )
+    .map_err(|e| AppError::Internal(e.into()))?;
+
+    Ok(Json(json!({
+        "token": jwt,
+        "username": username,
+        "expires_at": exp,
+    })))
+}
 
 pub async fn discord_login(State(state): State<AppState>) -> impl IntoResponse {
     // CSRF protection: generate a one-shot nonce, store it server-side,
@@ -106,6 +141,7 @@ pub async fn discord_callback(
     let claims = Claims {
         sub: user.id.clone(),
         username: user.username.clone(),
+        email: None,
         exp,
     };
 
@@ -142,4 +178,44 @@ pub fn verify_token(token: &str, secret: &str) -> Result<Claims, AppError> {
     )
     .map(|d| d.claims)
     .map_err(|e| AppError::Unauthorized(format!("Invalid token: {}", e)))
+}
+
+fn sanitize_username(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in raw.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+        } else if c.is_whitespace() && !out.ends_with('_') {
+            out.push('_');
+        }
+        if out.len() >= 24 {
+            break;
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.len() >= 2 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn normalize_email(raw: &str) -> Option<String> {
+    let email = raw.trim().to_ascii_lowercase();
+    if email.len() <= 254 && email.contains('@') && email.contains('.') {
+        Some(email)
+    } else {
+        None
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(bytes);
+    let mut out = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }

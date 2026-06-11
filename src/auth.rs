@@ -23,11 +23,13 @@ pub async fn guest_login(
     let username = sanitize_username(&req.username)
         .ok_or_else(|| AppError::BadRequest("Username must be 2-24 letters/numbers".into()))?;
     let email = req.email.as_deref().and_then(normalize_email);
-    let identity = email.as_deref().unwrap_or(&username);
-    let prefix = if email.is_some() {
-        "guest-email"
+    let device_id = req.device_id.as_deref().filter(|s| !s.is_empty());
+    let (prefix, identity): (&str, &str) = if let Some(e) = email.as_deref() {
+        ("guest-email", e)
+    } else if let Some(d) = device_id {
+        ("guest-device", d)
     } else {
-        "guest-name"
+        ("guest-name", &username)
     };
     let sub = format!("{prefix}:{}", sha256_hex(identity.as_bytes()));
     let exp = (Utc::now() + chrono::Duration::days(30)).timestamp() as usize;

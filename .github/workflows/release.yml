@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    name: Build & deploy to Cloud Run
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build & push image via Cloud Build
+        run: |
+          gcloud builds submit \
+            --tag "gcr.io/${{ secrets.GCP_PROJECT_ID }}/xband-signaling" \
+            --project "${{ secrets.GCP_PROJECT_ID }}"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy xband-signaling \
+            --image "gcr.io/${{ secrets.GCP_PROJECT_ID }}/xband-signaling" \
+            --platform managed \
+            --region us-central1 \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --allow-unauthenticated \
+            --min-instances 0 \
+            --max-instances 2 \
+            --memory 256Mi \
+            --cpu 1
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "Signaling server release ${{ github.ref_name }} — deployed to Cloud Run."

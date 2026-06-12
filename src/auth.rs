@@ -16,12 +16,17 @@ use crate::{
     state::{AppState, OAuthState},
 };
 
+const MAX_USERNAME_LEN: usize = 24;
+
 pub async fn guest_login(
     State(state): State<AppState>,
     Json(req): Json<GuestAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let username = sanitize_username(&req.username)
-        .ok_or_else(|| AppError::BadRequest("Username must be 2-24 letters/numbers".into()))?;
+    let username = sanitize_username(&req.username).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "Username must be 2-{MAX_USERNAME_LEN} letters/numbers"
+        ))
+    })?;
     let email = req.email.as_deref().and_then(normalize_email);
     let device_id = req.device_id.as_deref().filter(|s| !s.is_empty());
     let (prefix, identity): (&str, &str) = if let Some(e) = email.as_deref() {
@@ -190,7 +195,7 @@ fn sanitize_username(raw: &str) -> Option<String> {
         } else if c.is_whitespace() && !out.ends_with('_') {
             out.push('_');
         }
-        if out.len() >= 24 {
+        if out.len() >= MAX_USERNAME_LEN {
             break;
         }
     }

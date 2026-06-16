@@ -153,6 +153,143 @@ pub struct SparRoom {
     pub creator_discord_id: String,
     pub creator_username: String,
     pub created_at: DateTime<Utc>,
+    pub name: String,
+    pub format: LobbyMatchFormat,
+    pub private: bool,
+    pub app_version: String,
+    pub rom_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LobbyMatchFormat {
+    Vs,
+    Ft3,
+    Ft5,
+    Ft10,
+}
+
+impl Default for LobbyMatchFormat {
+    fn default() -> Self {
+        Self::Vs
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LobbyPresence {
+    pub player_id: String,
+    pub username: String,
+    pub status: String,
+    pub last_seen: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LobbyChatEntry {
+    pub message_id: String,
+    pub player_id: String,
+    pub username: String,
+    pub message: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LobbyUser {
+    pub player_id: String,
+    pub username: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LobbyChatMessage {
+    pub username: String,
+    pub message: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneralLobbyResponse {
+    pub status: String,
+    pub users: Vec<LobbyUser>,
+    pub chat: Vec<LobbyChatMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LobbyChatRequest {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LobbyRoomSummary {
+    pub id: String,
+    pub name: String,
+    pub host_username: String,
+    pub format: LobbyMatchFormat,
+    pub players: u8,
+    pub private: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LobbyListResponse {
+    pub lobbies: Vec<LobbyRoomSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Challenge {
+    pub challenge_id: String,
+    pub challenger_session_id: String,
+    pub challenger_discord_id: String,
+    pub challenger_username: String,
+    pub target_discord_id: String,
+    pub target_username: String,
+    pub format: LobbyMatchFormat,
+    pub stun_endpoint: String,
+    pub app_version: String,
+    pub rom_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeRequest {
+    pub target_id: String,
+    #[serde(default)]
+    pub format: LobbyMatchFormat,
+    pub stun_endpoint: String,
+    pub app_version: String,
+    #[serde(default)]
+    pub rom_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChallengeResponse {
+    pub challenge_id: String,
+    pub challenger_session_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChallengeSummary {
+    pub challenge_id: String,
+    pub direction: String,
+    pub challenger_id: String,
+    pub challenger_username: String,
+    pub target_id: String,
+    pub target_username: String,
+    pub format: LobbyMatchFormat,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChallengeListResponse {
+    pub challenges: Vec<ChallengeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceptChallengeRequest {
+    pub stun_endpoint: String,
+    pub app_version: String,
+    #[serde(default)]
+    pub rom_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -176,6 +313,12 @@ pub struct CreateRoomRequest {
     pub app_version: String,
     #[serde(default)]
     pub rom_hash: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub format: LobbyMatchFormat,
+    #[serde(default)]
+    pub private: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -39,6 +39,17 @@ const PENDING_RESULT_TTL_SECS: i64 = 60;
 /// peer either moved on or disconnected.
 const SPECTATOR_FRAME_TTL_SECS: i64 = 90;
 
+/// Lobby presence is a heartbeat; clients refresh every few seconds while
+/// viewing the Online Hub.
+const LOBBY_PRESENCE_TTL_SECS: i64 = 90;
+
+/// General lobby chat is intentionally short-lived in the signaling process.
+/// Durable chat history is not a goal for this server.
+const LOBBY_CHAT_TTL_SECS: i64 = 30 * 60;
+
+/// Direct challenges should expire quickly if the target doesn't accept.
+const CHALLENGE_TTL_SECS: i64 = 2 * 60;
+
 /// OAuth `state` nonces are short-lived; users complete the Discord round
 /// trip in seconds, not minutes.
 const OAUTH_STATE_TTL_SECS: i64 = 5 * 60;
@@ -56,12 +67,15 @@ pub fn spawn(state: AppState) {
             if counts.total() > 0 {
                 tracing::info!(
                     "[sweeper] reaped queue={} spar={} confirmed={} pending={} \
-                     spectator={} oauth={} (total {})",
+                     spectator={} lobby_presence={} lobby_chat={} challenges={} oauth={} (total {})",
                     counts.queue,
                     counts.spar,
                     counts.confirmed,
                     counts.pending,
                     counts.spectator,
+                    counts.lobby_presence,
+                    counts.lobby_chat,
+                    counts.challenges,
                     counts.oauth,
                     counts.total(),
                 );
@@ -77,12 +91,23 @@ struct SweepCounts {
     confirmed: usize,
     pending: usize,
     spectator: usize,
+    lobby_presence: usize,
+    lobby_chat: usize,
+    challenges: usize,
     oauth: usize,
 }
 
 impl SweepCounts {
     fn total(&self) -> usize {
-        self.queue + self.spar + self.confirmed + self.pending + self.spectator + self.oauth
+        self.queue
+            + self.spar
+            + self.confirmed
+            + self.pending
+            + self.spectator
+            + self.lobby_presence
+            + self.lobby_chat
+            + self.challenges
+            + self.oauth
     }
 }
 
@@ -261,6 +286,60 @@ fn sweep_once(state: &AppState) -> SweepCounts {
     for key in stale {
         if state.spectator_frames.remove(&key).is_some() {
             out.spectator += 1;
+        }
+    }
+
+    let stale: Vec<String> = state
+        .lobby_presence
+        .iter()
+        .filter_map(|e| {
+            if (now - e.last_seen).num_seconds() > LOBBY_PRESENCE_TTL_SECS {
+                Some(e.key().clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for key in stale {
+        if state.lobby_presence.remove(&key).is_some() {
+            out.lobby_presence += 1;
+        }
+    }
+
+    let stale: Vec<String> = state
+        .lobby_chat
+        .iter()
+        .filter_map(|e| {
+            if (now - e.created_at).num_seconds() > LOBBY_CHAT_TTL_SECS {
+                Some(e.key().clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for key in stale {
+        if state.lobby_chat.remove(&key).is_some() {
+            out.lobby_chat += 1;
+        }
+    }
+
+    let stale: Vec<String> = state
+        .challenges
+        .iter()
+        .filter_map(|e| {
+            if (now - e.created_at).num_seconds() > CHALLENGE_TTL_SECS {
+                Some(e.key().clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for key in stale {
+        if let Some((_, challenge)) = state.challenges.remove(&key) {
+            if let Some(mut entry) = state.queue.get_mut(&challenge.challenger_session_id) {
+                entry.cancelled = true;
+            }
+            out.challenges += 1;
         }
     }
 

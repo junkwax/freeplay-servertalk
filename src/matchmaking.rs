@@ -22,6 +22,9 @@ use crate::{
 };
 
 const TURN_TTL_SECS: u64 = 3600;
+const LOBBY_CHAT_MAX_CHARS: usize = 180;
+const LOBBY_CHAT_VISIBLE: usize = 50;
+const LOBBY_PRESENCE_VISIBLE_SECS: i64 = 90;
 
 // ── POST /match/lfg ───────────────────────────────────────────────────────────
 
@@ -219,6 +222,434 @@ fn mint_turn_for_room(state: &AppState, room_id: &str, role: u8) -> Option<TurnC
         role,
         TURN_TTL_SECS,
     ))
+}
+
+// ── General lobby and lobby browser ───────────────────────────────────────────
+
+pub async fn general_lobby(
+    State(state): State<AppState>,
+    auth: Option<TypedHeader<Authorization<Bearer>>>,
+) -> Result<Json<GeneralLobbyResponse>, AppError> {
+    if let Some(TypedHeader(auth)) = auth {
+        if let Ok(claims) = verify_token(auth.token(), &state.config.jwt_secret) {
+            touch_lobby_presence(&state, &claims, "online");
+        }
+    }
+
+    Ok(Json(general_lobby_snapshot(&state)))
+}
+
+pub async fn lobby_chat(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Json(req): Json<LobbyChatRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+    let message = normalize_lobby_chat(&req.message)?;
+    touch_lobby_presence(&state, &claims, "chatting");
+
+    let message_id = Uuid::new_v4().to_string();
+    state.lobby_chat.insert(
+        message_id.clone(),
+        LobbyChatEntry {
+            message_id,
+            player_id: claims.sub,
+            username: claims.username,
+            message,
+            created_at: Utc::now(),
+        },
+    );
+
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+pub async fn list_lobbies(
+    State(state): State<AppState>,
+) -> Result<Json<LobbyListResponse>, AppError> {
+    let mut lobbies: Vec<LobbyRoomSummary> = state
+        .spar_rooms
+        .iter()
+        .filter(|room| !room.private)
+        .map(|room| lobby_room_summary(&room))
+        .collect();
+    lobbies.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    Ok(Json(LobbyListResponse { lobbies }))
+}
+
+pub async fn list_challenges(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+) -> Result<Json<ChallengeListResponse>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+    touch_lobby_presence(&state, &claims, "online");
+
+    let mut challenges: Vec<ChallengeSummary> = state
+        .challenges
+        .iter()
+        .filter_map(|entry| {
+            let challenge = entry.value();
+            if challenge.target_discord_id == claims.sub {
+                Some(challenge_summary(challenge, "incoming"))
+            } else if challenge.challenger_discord_id == claims.sub {
+                Some(challenge_summary(challenge, "outgoing"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    challenges.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.challenge_id.cmp(&b.challenge_id))
+    });
+
+    Ok(Json(ChallengeListResponse { challenges }))
+}
+
+pub async fn send_challenge(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Json(req): Json<ChallengeRequest>,
+) -> Result<Json<ChallengeResponse>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+
+    if req.stun_endpoint.is_empty() || !req.stun_endpoint.contains(':') {
+        return Err(AppError::BadRequest("Invalid stun_endpoint".into()));
+    }
+    if req.target_id == claims.sub {
+        return Err(AppError::BadRequest("Cannot challenge yourself".into()));
+    }
+
+    let target = state
+        .lobby_presence
+        .get(&req.target_id)
+        .map(|presence| (presence.player_id.clone(), presence.username.clone()))
+        .ok_or_else(|| AppError::NotFound("Target player is not in the lobby".into()))?;
+
+    let challenge_id = Uuid::new_v4().to_string();
+    let challenger_session_id = Uuid::new_v4().to_string();
+
+    state.queue.insert(
+        challenger_session_id.clone(),
+        QueueEntry {
+            session_id: challenger_session_id.clone(),
+            discord_id: claims.sub.clone(),
+            username: claims.username.clone(),
+            stun_endpoint: req.stun_endpoint.clone(),
+            app_version: req.app_version.clone(),
+            rom_hash: req.rom_hash.clone(),
+            queued_at: Utc::now(),
+            match_info: None,
+            cancelled: false,
+            relayed_addr: None,
+        },
+    );
+    state
+        .player_sessions
+        .insert(claims.sub.clone(), challenger_session_id.clone());
+
+    state.challenges.insert(
+        challenge_id.clone(),
+        Challenge {
+            challenge_id: challenge_id.clone(),
+            challenger_session_id: challenger_session_id.clone(),
+            challenger_discord_id: claims.sub.clone(),
+            challenger_username: claims.username.clone(),
+            target_discord_id: target.0,
+            target_username: target.1,
+            format: req.format,
+            stun_endpoint: req.stun_endpoint,
+            app_version: req.app_version,
+            rom_hash: req.rom_hash,
+            created_at: Utc::now(),
+        },
+    );
+
+    touch_lobby_presence(&state, &claims, "challenging");
+    Ok(Json(ChallengeResponse {
+        challenge_id,
+        challenger_session_id,
+        status: "pending".into(),
+    }))
+}
+
+pub async fn accept_challenge(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Path(challenge_id): Path<String>,
+    Json(req): Json<AcceptChallengeRequest>,
+) -> Result<Json<JoinRoomResponse>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+
+    if req.stun_endpoint.is_empty() || !req.stun_endpoint.contains(':') {
+        return Err(AppError::BadRequest("Invalid stun_endpoint".into()));
+    }
+
+    let challenge = state
+        .challenges
+        .remove(&challenge_id)
+        .map(|(_, challenge)| challenge)
+        .ok_or_else(|| AppError::NotFound("Challenge not found or expired".into()))?;
+
+    if challenge.target_discord_id != claims.sub {
+        state
+            .challenges
+            .insert(challenge.challenge_id.clone(), challenge);
+        return Err(AppError::Unauthorized(
+            "Challenge does not belong to you".into(),
+        ));
+    }
+    if challenge.app_version != req.app_version || challenge.rom_hash != req.rom_hash {
+        state
+            .challenges
+            .insert(challenge.challenge_id.clone(), challenge);
+        return Err(AppError::BadRequest(
+            "Challenge requires matching app version and ROM hash".into(),
+        ));
+    }
+
+    let Some(mut challenger_entry) = state.queue.get_mut(&challenge.challenger_session_id) else {
+        return Err(AppError::NotFound("Challenger session expired".into()));
+    };
+    if challenger_entry.cancelled || challenger_entry.match_info.is_some() {
+        return Err(AppError::NotFound(
+            "Challenger is no longer available".into(),
+        ));
+    }
+
+    let acceptor_session_id = Uuid::new_v4().to_string();
+    let match_room_id = Uuid::new_v4().to_string();
+    let punch_at_ms = (Utc::now() + chrono::Duration::milliseconds(2500)).timestamp_millis();
+    let host_creds = mint_turn_for_room(&state, &match_room_id, 0);
+    let join_creds = mint_turn_for_room(&state, &match_room_id, 1);
+    let challenger_stun = challenger_entry.stun_endpoint.clone();
+
+    challenger_entry.match_info = Some(MatchInfo {
+        role: PlayerRole::Host,
+        peer_endpoint: req.stun_endpoint.clone(),
+        punch_at_ms,
+        room_id: match_room_id.clone(),
+        username: claims.username.clone(),
+        turn: host_creds,
+    });
+    drop(challenger_entry);
+
+    state.queue.insert(
+        acceptor_session_id.clone(),
+        QueueEntry {
+            session_id: acceptor_session_id.clone(),
+            discord_id: claims.sub.clone(),
+            username: claims.username.clone(),
+            stun_endpoint: req.stun_endpoint.clone(),
+            app_version: req.app_version,
+            rom_hash: req.rom_hash,
+            queued_at: Utc::now(),
+            match_info: Some(MatchInfo {
+                role: PlayerRole::Join,
+                peer_endpoint: challenger_stun.clone(),
+                punch_at_ms,
+                room_id: match_room_id.clone(),
+                username: challenge.challenger_username.clone(),
+                turn: join_creds.clone(),
+            }),
+            cancelled: false,
+            relayed_addr: None,
+        },
+    );
+    state
+        .player_sessions
+        .insert(claims.sub.clone(), acceptor_session_id.clone());
+
+    let (s, u1, u2) = (
+        state.clone(),
+        challenge.challenger_username.clone(),
+        claims.username.clone(),
+    );
+    tokio::spawn(async move { discord::notify_matched(&s, &u1, &u2).await });
+
+    tracing::info!(
+        "Challenge {} accepted: {} vs {} ({:?})",
+        challenge_id,
+        challenge.challenger_username,
+        claims.username,
+        challenge.format
+    );
+
+    Ok(Json(JoinRoomResponse {
+        session_id: acceptor_session_id,
+        match_info: MatchInfo {
+            role: PlayerRole::Join,
+            peer_endpoint: challenger_stun,
+            punch_at_ms,
+            room_id: match_room_id,
+            username: challenge.challenger_username,
+            turn: join_creds,
+        },
+    }))
+}
+
+pub async fn decline_challenge(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Path(challenge_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+    let challenge = state
+        .challenges
+        .remove(&challenge_id)
+        .map(|(_, challenge)| challenge)
+        .ok_or_else(|| AppError::NotFound("Challenge not found or expired".into()))?;
+
+    if challenge.target_discord_id != claims.sub && challenge.challenger_discord_id != claims.sub {
+        state
+            .challenges
+            .insert(challenge.challenge_id.clone(), challenge);
+        return Err(AppError::Unauthorized(
+            "Challenge does not belong to you".into(),
+        ));
+    }
+
+    if let Some(mut entry) = state.queue.get_mut(&challenge.challenger_session_id) {
+        entry.cancelled = true;
+    }
+    if let Some(sid) = state
+        .player_sessions
+        .get(&challenge.challenger_discord_id)
+        .map(|sid| sid.clone())
+    {
+        if sid == challenge.challenger_session_id {
+            state
+                .player_sessions
+                .remove(&challenge.challenger_discord_id);
+        }
+    }
+
+    Ok(Json(json!({ "status": "declined" })))
+}
+
+fn touch_lobby_presence(state: &AppState, claims: &Claims, status: &str) {
+    state.lobby_presence.insert(
+        claims.sub.clone(),
+        LobbyPresence {
+            player_id: claims.sub.clone(),
+            username: claims.username.clone(),
+            status: status.to_string(),
+            last_seen: Utc::now(),
+        },
+    );
+}
+
+fn general_lobby_snapshot(state: &AppState) -> GeneralLobbyResponse {
+    let now = Utc::now();
+    let mut users: Vec<LobbyUser> = state
+        .lobby_presence
+        .iter()
+        .filter(|entry| (now - entry.last_seen).num_seconds() <= LOBBY_PRESENCE_VISIBLE_SECS)
+        .map(|entry| LobbyUser {
+            player_id: entry.player_id.clone(),
+            username: entry.username.clone(),
+            status: entry.status.clone(),
+        })
+        .collect();
+    users.sort_by(|a, b| {
+        a.username
+            .cmp(&b.username)
+            .then_with(|| a.player_id.cmp(&b.player_id))
+    });
+
+    let mut chat_entries: Vec<LobbyChatEntry> = state
+        .lobby_chat
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect();
+    chat_entries.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.player_id.cmp(&b.player_id))
+            .then_with(|| a.message_id.cmp(&b.message_id))
+    });
+    let skip = chat_entries.len().saturating_sub(LOBBY_CHAT_VISIBLE);
+    let chat = chat_entries
+        .into_iter()
+        .skip(skip)
+        .map(|entry| LobbyChatMessage {
+            username: entry.username,
+            message: entry.message,
+            timestamp: entry.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    GeneralLobbyResponse {
+        status: "General lobby ready".into(),
+        users,
+        chat,
+    }
+}
+
+fn normalize_lobby_chat(raw: &str) -> Result<String, AppError> {
+    let message = raw.trim();
+    if message.is_empty() {
+        return Err(AppError::BadRequest("Message is empty".into()));
+    }
+    if message.chars().count() > LOBBY_CHAT_MAX_CHARS {
+        return Err(AppError::BadRequest("Message is too long".into()));
+    }
+    if message.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(AppError::BadRequest(
+            "Message contains control characters".into(),
+        ));
+    }
+    Ok(message.to_string())
+}
+
+fn lobby_room_summary(room: &SparRoom) -> LobbyRoomSummary {
+    LobbyRoomSummary {
+        id: room.room_id.clone(),
+        name: room.name.clone(),
+        host_username: room.creator_username.clone(),
+        format: room.format.clone(),
+        players: 1,
+        private: room.private,
+        status: "open".into(),
+    }
+}
+
+fn challenge_summary(challenge: &Challenge, direction: &str) -> ChallengeSummary {
+    ChallengeSummary {
+        challenge_id: challenge.challenge_id.clone(),
+        direction: direction.into(),
+        challenger_id: challenge.challenger_discord_id.clone(),
+        challenger_username: challenge.challenger_username.clone(),
+        target_id: challenge.target_discord_id.clone(),
+        target_username: challenge.target_username.clone(),
+        format: challenge.format.clone(),
+        created_at: challenge.created_at.to_rfc3339(),
+    }
+}
+
+fn sanitize_lobby_name(name: Option<&str>, fallback: &str) -> String {
+    let source = name.unwrap_or(fallback).trim();
+    let mut out = String::new();
+    for c in source.chars() {
+        if c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-' {
+            if c.is_whitespace() {
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        if out.len() >= 32 {
+            break;
+        }
+    }
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        format!("{fallback}'s Lobby")
+    } else {
+        out
+    }
 }
 
 // ── GET /match/status/:session_id ─────────────────────────────────────────────
@@ -752,6 +1183,7 @@ pub async fn create_room(
 
     let room_id = Uuid::new_v4().to_string();
     let creator_session_id = Uuid::new_v4().to_string();
+    let lobby_name = sanitize_lobby_name(req.name.as_deref(), &claims.username);
 
     // Register the room so someone can join it
     state.spar_rooms.insert(
@@ -761,6 +1193,11 @@ pub async fn create_room(
             creator_discord_id: claims.sub.clone(),
             creator_username: claims.username.clone(),
             created_at: Utc::now(),
+            name: lobby_name,
+            format: req.format.clone(),
+            private: req.private,
+            app_version: req.app_version.clone(),
+            rom_hash: req.rom_hash.clone(),
         },
     );
 
@@ -817,7 +1254,15 @@ pub async fn join_room(
         .ok_or_else(|| AppError::NotFound("Room not found or already joined".into()))?;
 
     if room.creator_discord_id == claims.sub {
+        state.spar_rooms.insert(room_id, room);
         return Err(AppError::BadRequest("Cannot join your own room".into()));
+    }
+
+    if room.app_version != req.app_version || room.rom_hash != req.rom_hash {
+        state.spar_rooms.insert(room_id, room);
+        return Err(AppError::BadRequest(
+            "Room requires matching app version and ROM hash".into(),
+        ));
     }
 
     // Find the creator's queue entry
@@ -854,6 +1299,7 @@ pub async fn join_room(
         username: claims.username.clone(),
         turn: host_creds,
     });
+    drop(creator_entry);
 
     // Create joiner's entry: they are Join
     state.queue.insert(
@@ -1078,4 +1524,54 @@ pub async fn live_matches(
     matches.retain(|m| seen.insert(m.room_id.clone()));
 
     Ok(Json(LiveMatchesResponse { matches }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lobby_room_summary, normalize_lobby_chat, sanitize_lobby_name};
+    use crate::models::{LobbyMatchFormat, SparRoom};
+    use chrono::Utc;
+
+    #[test]
+    fn sanitize_lobby_name_keeps_plain_player_text() {
+        assert_eq!(
+            sanitize_lobby_name(Some("  Friday FT5!!!  "), "Kitana"),
+            "Friday FT5"
+        );
+        assert_eq!(sanitize_lobby_name(Some("!!!"), "Kitana"), "Kitana's Lobby");
+        assert_eq!(sanitize_lobby_name(None, "SubZero"), "SubZero");
+    }
+
+    #[test]
+    fn normalize_lobby_chat_trims_and_rejects_bad_messages() {
+        assert_eq!(normalize_lobby_chat("  ft5?  ").unwrap(), "ft5?");
+        assert!(normalize_lobby_chat("").is_err());
+        assert!(normalize_lobby_chat(&"x".repeat(181)).is_err());
+        assert!(normalize_lobby_chat("hello\u{0007}").is_err());
+    }
+
+    #[test]
+    fn lobby_room_summary_keeps_public_lobby_metadata() {
+        let room = SparRoom {
+            room_id: "room-1".into(),
+            creator_discord_id: "p1".into(),
+            creator_username: "Jax".into(),
+            created_at: Utc::now(),
+            name: "Long Sets".into(),
+            format: LobbyMatchFormat::Ft10,
+            private: false,
+            app_version: "0.7.10".into(),
+            rom_hash: "abcd".into(),
+        };
+
+        let summary = lobby_room_summary(&room);
+
+        assert_eq!(summary.id, "room-1");
+        assert_eq!(summary.name, "Long Sets");
+        assert_eq!(summary.host_username, "Jax");
+        assert_eq!(summary.format, LobbyMatchFormat::Ft10);
+        assert_eq!(summary.players, 1);
+        assert!(!summary.private);
+        assert_eq!(summary.status, "open");
+    }
 }

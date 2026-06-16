@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    models::{QueueEntry, SparRoom, SpectatorFrame},
+    models::{Challenge, LobbyChatEntry, LobbyPresence, QueueEntry, SparRoom, SpectatorFrame},
 };
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -47,6 +47,9 @@ pub struct AppState {
     /// "already recorded" sentinel the dedup path checks.
     pub confirmed_results: Arc<DashMap<String, ConfirmedResult>>,
     pub spar_rooms: Arc<DashMap<String, SparRoom>>,
+    pub lobby_presence: Arc<DashMap<String, LobbyPresence>>,
+    pub lobby_chat: Arc<DashMap<String, LobbyChatEntry>>,
+    pub challenges: Arc<DashMap<String, Challenge>>,
     /// session_id → latest spectator frame pushed by a playing peer
     pub spectator_frames: Arc<DashMap<String, SpectatorFrame>>,
     /// nonce → issued-at timestamp for in-flight Discord OAuth CSRF tokens.
@@ -66,6 +69,9 @@ impl AppState {
             pending_results: Arc::new(DashMap::new()),
             confirmed_results: Arc::new(DashMap::new()),
             spar_rooms: Arc::new(DashMap::new()),
+            lobby_presence: Arc::new(DashMap::new()),
+            lobby_chat: Arc::new(DashMap::new()),
+            challenges: Arc::new(DashMap::new()),
             spectator_frames: Arc::new(DashMap::new()),
             oauth_states: Arc::new(DashMap::new()),
         })

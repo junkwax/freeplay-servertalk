@@ -72,6 +72,22 @@ async fn main() -> anyhow::Result<()> {
         // Spar rooms — join-to-spar via Discord RPC
         .route("/room/create", post(matchmaking::create_room))
         .route("/room/join/:room_id", post(matchmaking::join_room))
+        // Online lobby hub — presence, lobby chat, and public lobby browser
+        .route("/lobby/general", get(matchmaking::general_lobby))
+        .route("/lobby/chat", post(matchmaking::lobby_chat))
+        .route("/lobbies", get(matchmaking::list_lobbies))
+        .route(
+            "/challenges",
+            get(matchmaking::list_challenges).post(matchmaking::send_challenge),
+        )
+        .route(
+            "/challenges/:challenge_id/accept",
+            post(matchmaking::accept_challenge),
+        )
+        .route(
+            "/challenges/:challenge_id/decline",
+            post(matchmaking::decline_challenge),
+        )
         // Spectator relay — watching live matches
         .route(
             "/spectate/push/:session_id",

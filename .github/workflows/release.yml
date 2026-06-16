@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # Run JavaScript actions on Node 24 (Node 20 is deprecated on runners).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   deploy:
     name: Build & deploy to Cloud Run
@@ -25,10 +29,15 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Build & push image via Cloud Build
+        # --suppress-logs: the deployer service account isn't a project
+        # Viewer/Owner, so gcloud can't stream the build logs and exits 1 even
+        # though the build itself succeeds. Suppressing log streaming makes the
+        # command rely on the build's final status for its exit code.
         run: |
           gcloud builds submit \
             --tag "gcr.io/${{ secrets.GCP_PROJECT_ID }}/xband-signaling" \
-            --project "${{ secrets.GCP_PROJECT_ID }}"
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --suppress-logs
 
       - name: Deploy to Cloud Run
         run: |

@@ -460,6 +460,34 @@ pub async fn accept_challenge(
         .player_sessions
         .insert(claims.sub.clone(), acceptor_session_id.clone());
 
+    // Both players are now in a match. Drop every other pending challenge that
+    // involves either of them (as challenger or target) so a second target
+    // can't accept a now-busy player, and cancel the abandoned challengers'
+    // queue entries so their clients see a clean "cancelled" instead of a
+    // timeout. (The accepted challenge was already removed above.)
+    let challenger_id = challenge.challenger_discord_id.clone();
+    let acceptor_id = claims.sub.clone();
+    let stale: Vec<(String, String)> = state
+        .challenges
+        .iter()
+        .filter(|e| {
+            let c = e.value();
+            c.challenger_discord_id == challenger_id
+                || c.target_discord_id == challenger_id
+                || c.challenger_discord_id == acceptor_id
+                || c.target_discord_id == acceptor_id
+        })
+        .map(|e| (e.key().clone(), e.value().challenger_session_id.clone()))
+        .collect();
+    for (cid, challenger_session) in stale {
+        state.challenges.remove(&cid);
+        if let Some(mut entry) = state.queue.get_mut(&challenger_session) {
+            if entry.match_info.is_none() {
+                entry.cancelled = true;
+            }
+        }
+    }
+
     let (s, u1, u2) = (
         state.clone(),
         challenge.challenger_username.clone(),

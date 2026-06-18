@@ -122,6 +122,16 @@ pub struct MatchResultRequest {
     pub match_index: u32,
     pub p1_score: u16,
     pub p2_score: u16,
+    /// True when this result completes the whole set (best-of-N). Only then does
+    /// a king-of-the-hill lobby rotate its queue (winner stays / loser requeues),
+    /// so per-game posts mid-set don't rotate prematurely. Defaults to true for
+    /// backward compatibility with clients that post a single result per match.
+    #[serde(default = "default_true")]
+    pub set_over: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ── Internal queue entry ──────────────────────────────────────────────────────
@@ -197,6 +207,17 @@ pub struct LobbyMember {
     pub last_seen: DateTime<Utc>,
 }
 
+/// The next pairing, shown in the lobby while the incoming challenger has a
+/// short window to confirm they're ready. The champion (the winner staying on
+/// the hill, or the lobby's first player) is auto-ready; only the challenger
+/// must confirm.
+#[derive(Debug, Clone)]
+pub struct PendingMatch {
+    pub champion: String,
+    pub challenger: String,
+    pub deadline: DateTime<Utc>,
+}
+
 /// The two players currently fighting in a lobby and their match session ids.
 #[derive(Debug, Clone)]
 pub struct ActiveMatch {
@@ -225,6 +246,8 @@ pub struct KohLobby {
     pub members: Vec<LobbyMember>,
     /// player_ids in play order (front = next up).
     pub queue: std::collections::VecDeque<String>,
+    /// The pairing awaiting the challenger's ready confirmation, if any.
+    pub pending: Option<PendingMatch>,
     pub current: Option<ActiveMatch>,
 }
 
@@ -277,6 +300,16 @@ pub struct CurrentMatchView {
     pub join_session: String,
 }
 
+/// The pairing awaiting the challenger's ready confirmation.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadyCheckView {
+    pub champion_username: String,
+    pub challenger_username: String,
+    pub seconds_left: i64,
+    /// True for the challenger — the one who must press ready.
+    pub you_are_challenger: bool,
+}
+
 /// GET /lobby/:id — full lobby state from the caller's perspective.
 #[derive(Debug, Clone, Serialize)]
 pub struct LobbyStateResponse {
@@ -290,6 +323,9 @@ pub struct LobbyStateResponse {
     pub queue: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<CurrentMatchView>,
+    /// The next pairing awaiting a ready confirmation, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_check: Option<ReadyCheckView>,
     /// Caller's queue position (0 = next up), if queued and not playing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub your_position: Option<usize>,

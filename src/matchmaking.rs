@@ -1186,8 +1186,11 @@ pub async fn match_result(
         }
     }
 
-    // If this was a king-of-the-hill lobby match, rotate the queue.
-    koh_on_result(&state, &room_id, &koh_winner, &koh_loser);
+    // If this was a king-of-the-hill lobby match, rotate the queue — but only
+    // once the whole set is decided, not after each game of a best-of-N.
+    if req.set_over {
+        koh_on_result(&state, &room_id, &koh_winner, &koh_loser);
+    }
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -1447,24 +1450,80 @@ pub async fn join_room(
 
 // ── King-of-the-hill lobbies ────────────────────────────────────────────────
 
-/// Pair the next two queued players and start a match, if one isn't running.
-/// Inserts queue entries for the two sessions so the existing /match/status,
-/// /turn-ready and /match/result machinery applies unchanged.
-fn advance_lobby(state: &AppState, lobby: &mut KohLobby) {
-    if lobby.current.is_some() || lobby.queue.len() < 2 {
+/// How long the incoming challenger has to confirm they're ready.
+const READY_TIMEOUT_SECS: i64 = 10;
+
+/// Pick the next champion + challenger from the queue and open a ready check.
+/// The champion (front of the queue: the winner staying on the hill, or the
+/// lobby's first player) is auto-ready; the challenger must confirm within
+/// READY_TIMEOUT_SECS or be dropped to spectating.
+fn advance_lobby(_state: &AppState, lobby: &mut KohLobby) {
+    if lobby.current.is_some() || lobby.pending.is_some() {
         return;
     }
-    let host_id = lobby.queue.pop_front().unwrap();
-    let join_id = lobby.queue.pop_front().unwrap();
-    let host_m = lobby.members.iter().find(|m| m.player_id == host_id).cloned();
-    let join_m = lobby.members.iter().find(|m| m.player_id == join_id).cloned();
+    // Drop any queued ids that are no longer members.
+    let member_ids: std::collections::HashSet<String> =
+        lobby.members.iter().map(|m| m.player_id.clone()).collect();
+    lobby.queue.retain(|id| member_ids.contains(id));
+    if lobby.queue.len() < 2 {
+        return;
+    }
+    let champion = lobby.queue.pop_front().unwrap();
+    let challenger = lobby.queue.pop_front().unwrap();
+    tracing::info!("Lobby {} ready-check: champion vs challenger", lobby.id);
+    lobby.pending = Some(PendingMatch {
+        champion,
+        challenger,
+        deadline: Utc::now() + chrono::Duration::seconds(READY_TIMEOUT_SECS),
+    });
+    lobby.last_activity = Utc::now();
+}
+
+/// If the ready check timed out, drop the challenger to spectating, return the
+/// champion to the front of the queue, and re-advance to the next challenger.
+fn check_pending(state: &AppState, lobby: &mut KohLobby) {
+    let expired = lobby
+        .pending
+        .as_ref()
+        .map_or(false, |p| Utc::now() > p.deadline);
+    if !expired {
+        return;
+    }
+    let p = lobby.pending.take().unwrap();
+    if lobby.members.iter().any(|m| m.player_id == p.champion)
+        && !lobby.queue.iter().any(|id| id == &p.champion)
+    {
+        lobby.queue.push_front(p.champion);
+    }
+    lobby.queue.retain(|id| id != &p.challenger);
+    if let Some(m) = lobby.members.iter_mut().find(|m| m.player_id == p.challenger) {
+        m.role = LobbyRole::Spectating; // dropped from the rotation; can re-queue
+    }
+    tracing::info!("Lobby {} ready-check timed out — challenger skipped", lobby.id);
+    lobby.last_activity = Utc::now();
+    advance_lobby(state, lobby);
+}
+
+/// Both parties are go — start the actual match. Inserts queue entries for the
+/// two sessions so the existing /match/status, /turn-ready and /match/result
+/// machinery applies unchanged.
+fn promote_pending(state: &AppState, lobby: &mut KohLobby) {
+    let Some(p) = lobby.pending.take() else {
+        return;
+    };
+    let host_m = lobby.members.iter().find(|m| m.player_id == p.champion).cloned();
+    let join_m = lobby
+        .members
+        .iter()
+        .find(|m| m.player_id == p.challenger)
+        .cloned();
     let (Some(host_m), Some(join_m)) = (host_m, join_m) else {
-        // A queued id vanished from members — requeue any survivor.
-        for id in [host_id, join_id] {
+        for id in [p.champion, p.challenger] {
             if lobby.members.iter().any(|m| m.player_id == id) {
                 lobby.queue.push_front(id);
             }
         }
+        advance_lobby(state, lobby);
         return;
     };
 
@@ -1562,6 +1621,12 @@ fn lobby_state_for(state: &AppState, lobby: &KohLobby, caller: &str) -> LobbySta
         host_session: c.host_session.clone(),
         join_session: c.join_session.clone(),
     });
+    let ready_check = lobby.pending.as_ref().map(|p| ReadyCheckView {
+        champion_username: username_of(&p.champion),
+        challenger_username: username_of(&p.challenger),
+        seconds_left: (p.deadline - Utc::now()).num_seconds().max(0),
+        you_are_challenger: p.challenger == caller,
+    });
     let your_session = lobby.current.as_ref().and_then(|c| {
         if c.host == caller {
             Some(c.host_session.clone())
@@ -1583,6 +1648,7 @@ fn lobby_state_for(state: &AppState, lobby: &KohLobby, caller: &str) -> LobbySta
         members,
         queue,
         current,
+        ready_check,
         your_position: lobby.queue.iter().position(|id| id == caller),
         your_role: lobby
             .members
@@ -1609,6 +1675,22 @@ fn remove_lobby_member(state: &AppState, lobby: &mut KohLobby, player_id: &str) 
                 && !lobby.queue.iter().any(|id| id == &winner)
             {
                 lobby.queue.push_front(winner);
+            }
+        }
+    }
+    // If they were in a pending ready check, cancel it and re-queue the other.
+    if let Some(p) = lobby.pending.clone() {
+        if p.champion == player_id || p.challenger == player_id {
+            lobby.pending = None;
+            let other = if p.champion == player_id {
+                p.challenger
+            } else {
+                p.champion
+            };
+            if lobby.members.iter().any(|m| m.player_id == other)
+                && !lobby.queue.iter().any(|id| id == &other)
+            {
+                lobby.queue.push_front(other);
             }
         }
     }
@@ -1704,6 +1786,7 @@ pub async fn create_lobby(
             last_seen: Utc::now(),
         }],
         queue: std::collections::VecDeque::from([claims.sub.clone()]),
+        pending: None,
         current: None,
     };
     state.koh_lobbies.insert(lobby_id.clone(), lobby);
@@ -1776,6 +1859,36 @@ pub async fn get_lobby(
         .ok_or_else(|| AppError::NotFound("Lobby not found or already closed".into()))?;
     if let Some(m) = lobby.members.iter_mut().find(|m| m.player_id == claims.sub) {
         m.last_seen = Utc::now();
+    }
+    check_pending(&state, &mut lobby);
+    advance_lobby(&state, &mut lobby);
+    Ok(Json(lobby_state_for(&state, &lobby, &claims.sub)))
+}
+
+/// Challenger confirms they are ready for the pending match. When the front-of-
+/// queue challenger readies within the deadline, we promote the pending pair
+/// into a live match. The champion (winner staying / first player) is
+/// auto-ready, so only the challenger needs to call this.
+pub async fn ready_lobby(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Path(lobby_id): Path<String>,
+) -> Result<Json<LobbyStateResponse>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+    let mut lobby = state
+        .koh_lobbies
+        .get_mut(&lobby_id)
+        .ok_or_else(|| AppError::NotFound("Lobby not found or already closed".into()))?;
+    if let Some(m) = lobby.members.iter_mut().find(|m| m.player_id == claims.sub) {
+        m.last_seen = Utc::now();
+    }
+    check_pending(&state, &mut lobby);
+    let is_challenger = lobby
+        .pending
+        .as_ref()
+        .map_or(false, |p| p.challenger == claims.sub);
+    if is_challenger {
+        promote_pending(&state, &mut lobby);
     }
     advance_lobby(&state, &mut lobby);
     Ok(Json(lobby_state_for(&state, &lobby, &claims.sub)))
@@ -1873,6 +1986,10 @@ pub fn sweep_lobbies(state: &AppState) -> usize {
             for pid in idle {
                 remove_lobby_member(state, &mut lobby, &pid);
             }
+            // Expire stale ready-checks: a challenger who never confirmed in
+            // time is dropped to spectating and the next player is pulled up.
+            check_pending(state, &mut lobby);
+            advance_lobby(state, &mut lobby);
             empty = lobby.members.is_empty();
         }
         if empty {

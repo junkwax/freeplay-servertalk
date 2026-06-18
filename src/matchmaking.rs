@@ -1578,6 +1578,7 @@ fn lobby_state_for(state: &AppState, lobby: &KohLobby, caller: &str) -> LobbySta
         id: lobby.id.clone(),
         name: lobby.name.clone(),
         ranked: lobby.ranked,
+        private: lobby.private,
         format: lobby.format.clone(),
         members,
         queue,
@@ -1676,12 +1677,19 @@ pub async fn create_lobby(
     if req.stun_endpoint.is_empty() || !req.stun_endpoint.contains(':') {
         return Err(AppError::BadRequest("Invalid stun_endpoint".into()));
     }
-    let lobby_id = Uuid::new_v4().to_string();
+    // Short, typeable id so it doubles as an invite code for private lobbies.
+    let lobby_id = loop {
+        let code = Uuid::new_v4().simple().to_string()[..6].to_uppercase();
+        if !state.koh_lobbies.contains_key(&code) {
+            break code;
+        }
+    };
     let name = sanitize_lobby_name(Some(&req.name), &claims.username);
     let lobby = KohLobby {
         id: lobby_id.clone(),
         name,
         ranked: req.ranked,
+        private: req.private,
         format: req.format,
         host_id: claims.sub.clone(),
         app_version: req.app_version,
@@ -1797,6 +1805,7 @@ pub async fn list_koh_lobbies(
     let mut lobbies: Vec<LobbyRoomSummary> = state
         .koh_lobbies
         .iter()
+        .filter(|e| !e.value().private)
         .map(|e| {
             let l = e.value();
             let host = l

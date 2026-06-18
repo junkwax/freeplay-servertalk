@@ -213,6 +213,9 @@ pub struct KohLobby {
     pub id: String,
     pub name: String,
     pub ranked: bool,
+    /// Private lobbies are hidden from the public browser; joinable only by
+    /// sharing the (short) id as an invite code.
+    pub private: bool,
     pub format: LobbyMatchFormat,
     pub host_id: String,
     pub app_version: String,
@@ -230,6 +233,8 @@ pub struct CreateLobbyRequest {
     pub name: String,
     #[serde(default)]
     pub ranked: bool,
+    #[serde(default)]
+    pub private: bool,
     #[serde(default)]
     pub format: LobbyMatchFormat,
     pub stun_endpoint: String,
@@ -278,6 +283,7 @@ pub struct LobbyStateResponse {
     pub id: String,
     pub name: String,
     pub ranked: bool,
+    pub private: bool,
     pub format: LobbyMatchFormat,
     pub members: Vec<LobbyMemberView>,
     /// usernames in queue order (front = next up).

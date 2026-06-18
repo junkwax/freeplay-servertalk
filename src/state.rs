@@ -50,6 +50,9 @@ pub struct AppState {
     pub lobby_presence: Arc<DashMap<String, LobbyPresence>>,
     pub lobby_chat: Arc<DashMap<String, LobbyChatEntry>>,
     pub challenges: Arc<DashMap<String, Challenge>>,
+    /// player_id → (Glicko rating, fetched_at). Populated lazily from the stats
+    /// service so lobby presence can show each player's ranking.
+    pub ratings: Arc<DashMap<String, (i32, DateTime<Utc>)>>,
     /// session_id → latest spectator frame pushed by a playing peer
     pub spectator_frames: Arc<DashMap<String, SpectatorFrame>>,
     /// nonce → issued-at timestamp for in-flight Discord OAuth CSRF tokens.
@@ -72,6 +75,7 @@ impl AppState {
             lobby_presence: Arc::new(DashMap::new()),
             lobby_chat: Arc::new(DashMap::new()),
             challenges: Arc::new(DashMap::new()),
+            ratings: Arc::new(DashMap::new()),
             spectator_frames: Arc::new(DashMap::new()),
             oauth_states: Arc::new(DashMap::new()),
         })

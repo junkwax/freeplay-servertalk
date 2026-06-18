@@ -236,7 +236,55 @@ pub async fn general_lobby(
         }
     }
 
+    ensure_lobby_ratings(&state);
     Ok(Json(general_lobby_snapshot(&state)))
+}
+
+/// Glicko rating cache TTL — re-fetch a player's rating from the stats service
+/// at most this often.
+const RATING_TTL_SECS: i64 = 300;
+
+/// Spawn background rating fetches for any visible lobby player whose cached
+/// rating is missing or stale. Non-blocking; the rating shows on a later
+/// presence refresh once the fetch lands.
+fn ensure_lobby_ratings(state: &AppState) {
+    let Some(stats_url) = state.config.stats_service_url.clone() else {
+        return;
+    };
+    let now = Utc::now();
+    for entry in state.lobby_presence.iter() {
+        if (now - entry.last_seen).num_seconds() > LOBBY_PRESENCE_VISIBLE_SECS {
+            continue;
+        }
+        let pid = entry.player_id.clone();
+        let fresh = state
+            .ratings
+            .get(&pid)
+            .map(|r| (now - r.1).num_seconds() <= RATING_TTL_SECS)
+            .unwrap_or(false);
+        if fresh {
+            continue;
+        }
+        let http = state.http.clone();
+        let url = format!("{}/player/{}", stats_url.trim_end_matches('/'), pid);
+        let ratings = state.ratings.clone();
+        tokio::spawn(async move {
+            if let Some(rating) = fetch_player_rating(&http, &url).await {
+                ratings.insert(pid, (rating, Utc::now()));
+            }
+        });
+    }
+}
+
+async fn fetch_player_rating(http: &reqwest::Client, url: &str) -> Option<i32> {
+    let resp = http.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("rating")
+        .and_then(|v| v.as_f64())
+        .map(|r| r.round() as i32)
 }
 
 pub async fn lobby_chat(
@@ -577,6 +625,7 @@ fn general_lobby_snapshot(state: &AppState) -> GeneralLobbyResponse {
             player_id: entry.player_id.clone(),
             username: entry.username.clone(),
             status: entry.status.clone(),
+            rating: state.ratings.get(&entry.player_id).map(|r| r.0),
         })
         .collect();
     users.sort_by(|a, b| {

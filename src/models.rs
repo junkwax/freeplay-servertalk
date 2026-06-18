@@ -197,6 +197,9 @@ pub struct LobbyUser {
     pub player_id: String,
     pub username: String,
     pub status: String,
+    /// Glicko rating from the stats service, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]

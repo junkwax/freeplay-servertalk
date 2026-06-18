@@ -175,6 +175,129 @@ impl Default for LobbyMatchFormat {
     }
 }
 
+// ── King-of-the-hill lobbies ────────────────────────────────────────────────
+//
+// A persistent lobby: members either Queue to play or Spectate. Two queued
+// players play; winner returns to the front of the queue, loser to the back,
+// next queued player rotates in. Destroyed when the last member leaves.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LobbyRole {
+    Queued,
+    Spectating,
+}
+
+#[derive(Debug, Clone)]
+pub struct LobbyMember {
+    pub player_id: String,
+    pub username: String,
+    pub stun_endpoint: String,
+    pub role: LobbyRole,
+    pub last_seen: DateTime<Utc>,
+}
+
+/// The two players currently fighting in a lobby and their match session ids.
+#[derive(Debug, Clone)]
+pub struct ActiveMatch {
+    pub host: String, // player_id (P1)
+    pub join: String, // player_id (P2)
+    pub room_id: String,
+    pub host_session: String,
+    pub join_session: String,
+    pub started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KohLobby {
+    pub id: String,
+    pub name: String,
+    pub ranked: bool,
+    pub format: LobbyMatchFormat,
+    pub host_id: String,
+    pub app_version: String,
+    pub rom_hash: String,
+    pub created_at: DateTime<Utc>,
+    pub last_activity: DateTime<Utc>,
+    pub members: Vec<LobbyMember>,
+    /// player_ids in play order (front = next up).
+    pub queue: std::collections::VecDeque<String>,
+    pub current: Option<ActiveMatch>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateLobbyRequest {
+    pub name: String,
+    #[serde(default)]
+    pub ranked: bool,
+    #[serde(default)]
+    pub format: LobbyMatchFormat,
+    pub stun_endpoint: String,
+    pub app_version: String,
+    #[serde(default)]
+    pub rom_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateLobbyResponse {
+    pub lobby_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JoinLobbyRequest {
+    pub stun_endpoint: String,
+    /// Join as a spectator instead of entering the play queue.
+    #[serde(default)]
+    pub spectate: bool,
+    pub app_version: String,
+    #[serde(default)]
+    pub rom_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LobbyMemberView {
+    pub player_id: String,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<i32>,
+    pub role: LobbyRole,
+    pub in_match: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CurrentMatchView {
+    pub host_username: String,
+    pub join_username: String,
+    pub host_session: String,
+    pub join_session: String,
+}
+
+/// GET /lobby/:id — full lobby state from the caller's perspective.
+#[derive(Debug, Clone, Serialize)]
+pub struct LobbyStateResponse {
+    pub id: String,
+    pub name: String,
+    pub ranked: bool,
+    pub format: LobbyMatchFormat,
+    pub members: Vec<LobbyMemberView>,
+    /// usernames in queue order (front = next up).
+    pub queue: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<CurrentMatchView>,
+    /// Caller's queue position (0 = next up), if queued and not playing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub your_position: Option<usize>,
+    /// Caller's role in the lobby, if a member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub your_role: Option<LobbyRole>,
+    /// Set when it's the caller's turn to play — connect with this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub your_match: Option<MatchInfo>,
+    /// The caller's match session id when playing (for /match/result + spectate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub your_session: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LobbyPresence {
     pub player_id: String,

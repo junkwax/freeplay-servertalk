@@ -67,7 +67,8 @@ pub fn spawn(state: AppState) {
             if counts.total() > 0 {
                 tracing::info!(
                     "[sweeper] reaped queue={} spar={} confirmed={} pending={} \
-                     spectator={} lobby_presence={} lobby_chat={} challenges={} oauth={} (total {})",
+                     spectator={} lobby_presence={} lobby_chat={} challenges={} oauth={} \
+                     lobbies={} (total {})",
                     counts.queue,
                     counts.spar,
                     counts.confirmed,
@@ -77,6 +78,7 @@ pub fn spawn(state: AppState) {
                     counts.lobby_chat,
                     counts.challenges,
                     counts.oauth,
+                    counts.lobbies,
                     counts.total(),
                 );
             }
@@ -95,6 +97,7 @@ struct SweepCounts {
     lobby_chat: usize,
     challenges: usize,
     oauth: usize,
+    lobbies: usize,
 }
 
 impl SweepCounts {
@@ -108,6 +111,7 @@ impl SweepCounts {
             + self.lobby_chat
             + self.challenges
             + self.oauth
+            + self.lobbies
     }
 }
 
@@ -359,6 +363,8 @@ fn sweep_once(state: &AppState) -> SweepCounts {
             out.oauth += 1;
         }
     }
+
+    out.lobbies = crate::matchmaking::sweep_lobbies(state);
 
     out
 }

@@ -1,6 +1,8 @@
 use crate::{
     config::Config,
-    models::{Challenge, LobbyChatEntry, LobbyPresence, QueueEntry, SparRoom, SpectatorFrame},
+    models::{
+        Challenge, KohLobby, LobbyChatEntry, LobbyPresence, QueueEntry, SparRoom, SpectatorFrame,
+    },
 };
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -47,6 +49,8 @@ pub struct AppState {
     /// "already recorded" sentinel the dedup path checks.
     pub confirmed_results: Arc<DashMap<String, ConfirmedResult>>,
     pub spar_rooms: Arc<DashMap<String, SparRoom>>,
+    /// lobby_id → persistent king-of-the-hill lobby.
+    pub koh_lobbies: Arc<DashMap<String, KohLobby>>,
     pub lobby_presence: Arc<DashMap<String, LobbyPresence>>,
     pub lobby_chat: Arc<DashMap<String, LobbyChatEntry>>,
     pub challenges: Arc<DashMap<String, Challenge>>,
@@ -72,6 +76,7 @@ impl AppState {
             pending_results: Arc::new(DashMap::new()),
             confirmed_results: Arc::new(DashMap::new()),
             spar_rooms: Arc::new(DashMap::new()),
+            koh_lobbies: Arc::new(DashMap::new()),
             lobby_presence: Arc::new(DashMap::new()),
             lobby_chat: Arc::new(DashMap::new()),
             challenges: Arc::new(DashMap::new()),

@@ -1155,27 +1155,39 @@ pub async fn match_result(
         match_index
     );
 
+    let koh_winner = winner_id.clone();
+    let koh_loser = loser_id.clone();
+    // Unranked king-of-the-hill matches are casual — don't touch ratings.
+    let skip_stats = is_unranked_lobby_room(&state, &room_id);
+
     // Forward to stats service if configured. Retry with backoff on transient
     // failure so a cold-starting stats Cloud Run instance doesn't drop the
     // result. Auth errors / 4xx aren't retried — those are configuration bugs.
-    if let (Some(url), Some(key)) = (&state.config.stats_service_url, &state.config.stats_api_key) {
-        let payload = StatsForward {
-            room_id: result_id,
-            winner_id,
-            loser_id,
-            winner_score,
-            loser_score,
-            rom_hash,
-            winner_username,
-            loser_username,
-        };
-        let state_clone = state.clone();
-        let url_clone = url.clone();
-        let key_clone = key.clone();
-        tokio::spawn(async move {
-            forward_to_stats_with_retry(&state_clone, &url_clone, &key_clone, &payload).await;
-        });
+    if !skip_stats {
+        if let (Some(url), Some(key)) =
+            (&state.config.stats_service_url, &state.config.stats_api_key)
+        {
+            let payload = StatsForward {
+                room_id: result_id,
+                winner_id,
+                loser_id,
+                winner_score,
+                loser_score,
+                rom_hash,
+                winner_username,
+                loser_username,
+            };
+            let state_clone = state.clone();
+            let url_clone = url.clone();
+            let key_clone = key.clone();
+            tokio::spawn(async move {
+                forward_to_stats_with_retry(&state_clone, &url_clone, &key_clone, &payload).await;
+            });
+        }
     }
+
+    // If this was a king-of-the-hill lobby match, rotate the queue.
+    koh_on_result(&state, &room_id, &koh_winner, &koh_loser);
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -1431,6 +1443,435 @@ pub async fn join_room(
             turn: join_creds,
         },
     }))
+}
+
+// ── King-of-the-hill lobbies ────────────────────────────────────────────────
+
+/// Pair the next two queued players and start a match, if one isn't running.
+/// Inserts queue entries for the two sessions so the existing /match/status,
+/// /turn-ready and /match/result machinery applies unchanged.
+fn advance_lobby(state: &AppState, lobby: &mut KohLobby) {
+    if lobby.current.is_some() || lobby.queue.len() < 2 {
+        return;
+    }
+    let host_id = lobby.queue.pop_front().unwrap();
+    let join_id = lobby.queue.pop_front().unwrap();
+    let host_m = lobby.members.iter().find(|m| m.player_id == host_id).cloned();
+    let join_m = lobby.members.iter().find(|m| m.player_id == join_id).cloned();
+    let (Some(host_m), Some(join_m)) = (host_m, join_m) else {
+        // A queued id vanished from members — requeue any survivor.
+        for id in [host_id, join_id] {
+            if lobby.members.iter().any(|m| m.player_id == id) {
+                lobby.queue.push_front(id);
+            }
+        }
+        return;
+    };
+
+    let room_id = Uuid::new_v4().to_string();
+    let host_session = Uuid::new_v4().to_string();
+    let join_session = Uuid::new_v4().to_string();
+    let punch_at_ms = (Utc::now() + chrono::Duration::milliseconds(2500)).timestamp_millis();
+    let host_creds = mint_turn_for_room(state, &room_id, 0);
+    let join_creds = mint_turn_for_room(state, &room_id, 1);
+
+    let mk_entry = |session: &str, me: &LobbyMember, role: PlayerRole, peer: &LobbyMember, turn| {
+        QueueEntry {
+            session_id: session.to_string(),
+            discord_id: me.player_id.clone(),
+            username: me.username.clone(),
+            stun_endpoint: me.stun_endpoint.clone(),
+            app_version: lobby.app_version.clone(),
+            rom_hash: lobby.rom_hash.clone(),
+            queued_at: Utc::now(),
+            match_info: Some(MatchInfo {
+                role,
+                peer_endpoint: peer.stun_endpoint.clone(),
+                punch_at_ms,
+                room_id: room_id.clone(),
+                username: peer.username.clone(),
+                turn,
+            }),
+            cancelled: false,
+            relayed_addr: None,
+        }
+    };
+    state.queue.insert(
+        host_session.clone(),
+        mk_entry(&host_session, &host_m, PlayerRole::Host, &join_m, host_creds),
+    );
+    state.queue.insert(
+        join_session.clone(),
+        mk_entry(&join_session, &join_m, PlayerRole::Join, &host_m, join_creds),
+    );
+    state
+        .player_sessions
+        .insert(host_m.player_id.clone(), host_session.clone());
+    state
+        .player_sessions
+        .insert(join_m.player_id.clone(), join_session.clone());
+
+    tracing::info!(
+        "Lobby {} pairing {} vs {}",
+        lobby.id,
+        host_m.username,
+        join_m.username
+    );
+    lobby.current = Some(ActiveMatch {
+        host: host_m.player_id,
+        join: join_m.player_id,
+        room_id,
+        host_session,
+        join_session,
+        started_at: Utc::now(),
+    });
+    lobby.last_activity = Utc::now();
+}
+
+/// Build the caller's view of a lobby.
+fn lobby_state_for(state: &AppState, lobby: &KohLobby, caller: &str) -> LobbyStateResponse {
+    let in_match = |pid: &str| {
+        lobby
+            .current
+            .as_ref()
+            .map_or(false, |c| c.host == pid || c.join == pid)
+    };
+    let username_of = |pid: &str| {
+        lobby
+            .members
+            .iter()
+            .find(|m| m.player_id == pid)
+            .map(|m| m.username.clone())
+            .unwrap_or_default()
+    };
+    let members = lobby
+        .members
+        .iter()
+        .map(|m| LobbyMemberView {
+            player_id: m.player_id.clone(),
+            username: m.username.clone(),
+            rating: state.ratings.get(&m.player_id).map(|r| r.0),
+            role: m.role,
+            in_match: in_match(&m.player_id),
+        })
+        .collect();
+    let queue = lobby.queue.iter().map(|id| username_of(id)).collect();
+    let current = lobby.current.as_ref().map(|c| CurrentMatchView {
+        host_username: username_of(&c.host),
+        join_username: username_of(&c.join),
+        host_session: c.host_session.clone(),
+        join_session: c.join_session.clone(),
+    });
+    let your_session = lobby.current.as_ref().and_then(|c| {
+        if c.host == caller {
+            Some(c.host_session.clone())
+        } else if c.join == caller {
+            Some(c.join_session.clone())
+        } else {
+            None
+        }
+    });
+    let your_match = your_session
+        .as_ref()
+        .and_then(|s| state.queue.get(s).and_then(|e| e.match_info.clone()));
+    LobbyStateResponse {
+        id: lobby.id.clone(),
+        name: lobby.name.clone(),
+        ranked: lobby.ranked,
+        format: lobby.format.clone(),
+        members,
+        queue,
+        current,
+        your_position: lobby.queue.iter().position(|id| id == caller),
+        your_role: lobby
+            .members
+            .iter()
+            .find(|m| m.player_id == caller)
+            .map(|m| m.role),
+        your_match,
+        your_session,
+    }
+}
+
+/// Remove a member; if they were mid-match the opponent wins by default. Caller
+/// must destroy the lobby afterward if `members` is now empty.
+fn remove_lobby_member(state: &AppState, lobby: &mut KohLobby, player_id: &str) {
+    lobby.queue.retain(|id| id != player_id);
+    lobby.members.retain(|m| m.player_id != player_id);
+    if let Some(c) = lobby.current.clone() {
+        if c.host == player_id || c.join == player_id {
+            let winner = if c.host == player_id { c.join } else { c.host };
+            state.queue.remove(&c.host_session);
+            state.queue.remove(&c.join_session);
+            lobby.current = None;
+            if lobby.members.iter().any(|m| m.player_id == winner)
+                && !lobby.queue.iter().any(|id| id == &winner)
+            {
+                lobby.queue.push_front(winner);
+            }
+        }
+    }
+    lobby.last_activity = Utc::now();
+    advance_lobby(state, lobby);
+}
+
+/// Hook from /match/result: advance the lobby whose current match just ended.
+/// Winner returns to the front of the queue, loser to the back.
+pub fn koh_on_result(state: &AppState, room_id: &str, winner_id: &str, loser_id: &str) {
+    let lobby_id = state
+        .koh_lobbies
+        .iter()
+        .find(|e| {
+            e.value()
+                .current
+                .as_ref()
+                .map_or(false, |c| c.room_id == room_id)
+        })
+        .map(|e| e.key().clone());
+    let Some(lobby_id) = lobby_id else { return };
+    if let Some(mut lobby) = state.koh_lobbies.get_mut(&lobby_id) {
+        if let Some(c) = lobby.current.clone() {
+            state.queue.remove(&c.host_session);
+            state.queue.remove(&c.join_session);
+        }
+        lobby.current = None;
+        if lobby.members.iter().any(|m| m.player_id == winner_id)
+            && !lobby.queue.iter().any(|id| id == winner_id)
+        {
+            lobby.queue.push_front(winner_id.to_string());
+        }
+        if lobby.members.iter().any(|m| m.player_id == loser_id)
+            && !lobby.queue.iter().any(|id| id == loser_id)
+        {
+            lobby.queue.push_back(loser_id.to_string());
+        }
+        lobby.last_activity = Utc::now();
+        advance_lobby(&state, &mut lobby);
+        tracing::info!(
+            "Lobby {} advanced: {} stays, {} requeued",
+            lobby_id,
+            winner_id,
+            loser_id
+        );
+    }
+}
+
+/// True if `room_id` is the active match of an *unranked* KoH lobby (skip stats).
+pub fn is_unranked_lobby_room(state: &AppState, room_id: &str) -> bool {
+    state.koh_lobbies.iter().any(|e| {
+        !e.value().ranked
+            && e.value()
+                .current
+                .as_ref()
+                .map_or(false, |c| c.room_id == room_id)
+    })
+}
+
+pub async fn create_lobby(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Json(req): Json<CreateLobbyRequest>,
+) -> Result<Json<CreateLobbyResponse>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+    if req.stun_endpoint.is_empty() || !req.stun_endpoint.contains(':') {
+        return Err(AppError::BadRequest("Invalid stun_endpoint".into()));
+    }
+    let lobby_id = Uuid::new_v4().to_string();
+    let name = sanitize_lobby_name(Some(&req.name), &claims.username);
+    let lobby = KohLobby {
+        id: lobby_id.clone(),
+        name,
+        ranked: req.ranked,
+        format: req.format,
+        host_id: claims.sub.clone(),
+        app_version: req.app_version,
+        rom_hash: req.rom_hash,
+        created_at: Utc::now(),
+        last_activity: Utc::now(),
+        members: vec![LobbyMember {
+            player_id: claims.sub.clone(),
+            username: claims.username.clone(),
+            stun_endpoint: req.stun_endpoint,
+            role: LobbyRole::Queued,
+            last_seen: Utc::now(),
+        }],
+        queue: std::collections::VecDeque::from([claims.sub.clone()]),
+        current: None,
+    };
+    state.koh_lobbies.insert(lobby_id.clone(), lobby);
+    tracing::info!("Lobby {} created by {}", lobby_id, claims.username);
+    Ok(Json(CreateLobbyResponse { lobby_id }))
+}
+
+pub async fn join_lobby(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Path(lobby_id): Path<String>,
+    Json(req): Json<JoinLobbyRequest>,
+) -> Result<Json<LobbyStateResponse>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+    if req.stun_endpoint.is_empty() || !req.stun_endpoint.contains(':') {
+        return Err(AppError::BadRequest("Invalid stun_endpoint".into()));
+    }
+    let mut lobby = state
+        .koh_lobbies
+        .get_mut(&lobby_id)
+        .ok_or_else(|| AppError::NotFound("Lobby not found or already closed".into()))?;
+    if lobby.app_version != req.app_version || lobby.rom_hash != req.rom_hash {
+        return Err(AppError::BadRequest(
+            "Lobby requires matching app version and ROM hash".into(),
+        ));
+    }
+    let role = if req.spectate {
+        LobbyRole::Spectating
+    } else {
+        LobbyRole::Queued
+    };
+    if let Some(m) = lobby.members.iter_mut().find(|m| m.player_id == claims.sub) {
+        m.stun_endpoint = req.stun_endpoint;
+        m.role = role;
+        m.last_seen = Utc::now();
+    } else {
+        lobby.members.push(LobbyMember {
+            player_id: claims.sub.clone(),
+            username: claims.username.clone(),
+            stun_endpoint: req.stun_endpoint,
+            role,
+            last_seen: Utc::now(),
+        });
+    }
+    let playing = lobby
+        .current
+        .as_ref()
+        .map_or(false, |c| c.host == claims.sub || c.join == claims.sub);
+    if role == LobbyRole::Queued {
+        if !playing && !lobby.queue.iter().any(|id| id == &claims.sub) {
+            lobby.queue.push_back(claims.sub.clone());
+        }
+    } else {
+        lobby.queue.retain(|id| id != &claims.sub);
+    }
+    lobby.last_activity = Utc::now();
+    advance_lobby(&state, &mut lobby);
+    Ok(Json(lobby_state_for(&state, &lobby, &claims.sub)))
+}
+
+pub async fn get_lobby(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Path(lobby_id): Path<String>,
+) -> Result<Json<LobbyStateResponse>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+    let mut lobby = state
+        .koh_lobbies
+        .get_mut(&lobby_id)
+        .ok_or_else(|| AppError::NotFound("Lobby not found or already closed".into()))?;
+    if let Some(m) = lobby.members.iter_mut().find(|m| m.player_id == claims.sub) {
+        m.last_seen = Utc::now();
+    }
+    advance_lobby(&state, &mut lobby);
+    Ok(Json(lobby_state_for(&state, &lobby, &claims.sub)))
+}
+
+pub async fn leave_lobby(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Path(lobby_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+    let mut empty = false;
+    if let Some(mut lobby) = state.koh_lobbies.get_mut(&lobby_id) {
+        remove_lobby_member(&state, &mut lobby, &claims.sub);
+        empty = lobby.members.is_empty();
+    }
+    if empty {
+        state.koh_lobbies.remove(&lobby_id);
+        tracing::info!("Lobby {} destroyed (empty)", lobby_id);
+    }
+    Ok(Json(json!({ "status": "left" })))
+}
+
+pub async fn list_koh_lobbies(
+    State(state): State<AppState>,
+) -> Result<Json<LobbyListResponse>, AppError> {
+    let mut lobbies: Vec<LobbyRoomSummary> = state
+        .koh_lobbies
+        .iter()
+        .map(|e| {
+            let l = e.value();
+            let host = l
+                .members
+                .iter()
+                .find(|m| m.player_id == l.host_id)
+                .or_else(|| l.members.first())
+                .map(|m| m.username.clone())
+                .unwrap_or_else(|| "Host".into());
+            LobbyRoomSummary {
+                id: l.id.clone(),
+                name: l.name.clone(),
+                host_username: host,
+                format: l.format.clone(),
+                players: l.members.len().min(u8::MAX as usize) as u8,
+                private: false,
+                status: if l.current.is_some() {
+                    "in match".into()
+                } else {
+                    "open".into()
+                },
+            }
+        })
+        .collect();
+    lobbies.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    Ok(Json(LobbyListResponse { lobbies }))
+}
+
+/// Member heartbeat lapse (clients poll GET /koh/:id every ~2s while viewing).
+const LOBBY_MEMBER_TTL_SECS: i64 = 60;
+/// A `current` match that never produced a result is abandoned after this.
+const LOBBY_MATCH_TTL_SECS: i64 = 10 * 60;
+
+/// Reap idle members, abandon stuck matches, and destroy empty lobbies.
+/// Returns the number of lobbies destroyed. Active (playing) members are never
+/// reaped for idleness — they aren't polling while in a match.
+pub fn sweep_lobbies(state: &AppState) -> usize {
+    let now = Utc::now();
+    let ids: Vec<String> = state.koh_lobbies.iter().map(|e| e.key().clone()).collect();
+    let mut destroyed = 0;
+    for id in ids {
+        let mut empty = false;
+        if let Some(mut lobby) = state.koh_lobbies.get_mut(&id) {
+            if let Some(c) = lobby.current.clone() {
+                if (now - c.started_at).num_seconds() > LOBBY_MATCH_TTL_SECS {
+                    state.queue.remove(&c.host_session);
+                    state.queue.remove(&c.join_session);
+                    lobby.current = None;
+                }
+            }
+            let active: Vec<String> = lobby
+                .current
+                .as_ref()
+                .map(|c| vec![c.host.clone(), c.join.clone()])
+                .unwrap_or_default();
+            let idle: Vec<String> = lobby
+                .members
+                .iter()
+                .filter(|m| {
+                    !active.contains(&m.player_id)
+                        && (now - m.last_seen).num_seconds() > LOBBY_MEMBER_TTL_SECS
+                })
+                .map(|m| m.player_id.clone())
+                .collect();
+            for pid in idle {
+                remove_lobby_member(state, &mut lobby, &pid);
+            }
+            empty = lobby.members.is_empty();
+        }
+        if empty {
+            state.koh_lobbies.remove(&id);
+            destroyed += 1;
+        }
+    }
+    destroyed
 }
 
 // ── Spectator relay ────────────────────────────────────────────────────────

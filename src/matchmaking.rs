@@ -1907,6 +1907,7 @@ pub async fn leave_lobby(
     }
     if empty {
         state.koh_lobbies.remove(&lobby_id);
+        state.lobby_thumbs.remove(&lobby_id);
         tracing::info!("Lobby {} destroyed (empty)", lobby_id);
     }
     Ok(Json(json!({ "status": "left" })))
@@ -1945,6 +1946,56 @@ pub async fn list_koh_lobbies(
         .collect();
     lobbies.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
     Ok(Json(LobbyListResponse { lobbies }))
+}
+
+/// Cap on a pushed lobby thumbnail. The client sends a small gzipped frame
+/// (~tens of KB); this keeps the endpoint from being used as cheap storage.
+const MAX_LOBBY_THUMB_BYTES: usize = 256 * 1024;
+
+/// POST /koh/:lobby_id/thumb — an active player in the lobby's current match
+/// pushes a periodic screenshot (opaque gzipped bytes). Only the two players in
+/// the current match may push; everyone else just watches.
+pub async fn put_lobby_thumb(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    Path(lobby_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let claims = verify_token(auth.token(), &state.config.jwt_secret)?;
+    if body.len() > MAX_LOBBY_THUMB_BYTES {
+        return Err(AppError::BadRequest("Thumbnail too large".into()));
+    }
+    let is_player = state.koh_lobbies.get(&lobby_id).map_or(false, |l| {
+        l.current
+            .as_ref()
+            .map_or(false, |c| c.host == claims.sub || c.join == claims.sub)
+    });
+    if !is_player {
+        return Err(AppError::Unauthorized(
+            "Only active players can push a lobby thumbnail".into(),
+        ));
+    }
+    state
+        .lobby_thumbs
+        .insert(lobby_id, (body.to_vec(), Utc::now()));
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// GET /koh/:lobby_id/thumb — latest match screenshot for the lobby. Public so
+/// any spectator can show it. Returns the opaque (gzipped) bytes as-is.
+pub async fn get_lobby_thumb(
+    State(state): State<AppState>,
+    Path(lobby_id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.lobby_thumbs.get(&lobby_id) {
+        Some(entry) => {
+            let bytes = entry.value().0.clone();
+            ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes)
+                .into_response()
+        }
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Member heartbeat lapse (clients poll GET /koh/:id every ~2s while viewing).
@@ -1994,6 +2045,7 @@ pub fn sweep_lobbies(state: &AppState) -> usize {
         }
         if empty {
             state.koh_lobbies.remove(&id);
+            state.lobby_thumbs.remove(&id);
             destroyed += 1;
         }
     }

@@ -59,6 +59,9 @@ pub struct AppState {
     pub ratings: Arc<DashMap<String, (i32, DateTime<Utc>)>>,
     /// session_id → latest spectator frame pushed by a playing peer
     pub spectator_frames: Arc<DashMap<String, SpectatorFrame>>,
+    /// lobby_id → (gzipped thumbnail bytes, updated_at). The active players in a
+    /// KoH match push a small periodic screenshot; lobby viewers fetch it.
+    pub lobby_thumbs: Arc<DashMap<String, (Vec<u8>, DateTime<Utc>)>>,
     /// nonce → issued-at timestamp for in-flight Discord OAuth CSRF tokens.
     pub oauth_states: Arc<DashMap<String, OAuthState>>,
 }
@@ -82,6 +85,7 @@ impl AppState {
             challenges: Arc::new(DashMap::new()),
             ratings: Arc::new(DashMap::new()),
             spectator_frames: Arc::new(DashMap::new()),
+            lobby_thumbs: Arc::new(DashMap::new()),
             oauth_states: Arc::new(DashMap::new()),
         })
     }

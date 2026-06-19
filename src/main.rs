@@ -86,6 +86,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/koh/:lobby_id/leave", post(matchmaking::leave_lobby))
         .route("/koh/:lobby_id/ready", post(matchmaking::ready_lobby))
         .route(
+            "/koh/:lobby_id/thumb",
+            get(matchmaking::get_lobby_thumb).post(matchmaking::put_lobby_thumb),
+        )
+        .route(
             "/challenges",
             get(matchmaking::list_challenges).post(matchmaking::send_challenge),
         )

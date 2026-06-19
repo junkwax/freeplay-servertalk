@@ -68,6 +68,10 @@ pub struct IncidentRequest {
     /// ROM hash from the client's mk2.zip.
     #[serde(default)]
     pub rom_hash: String,
+    /// Stable per-install id. Lets us attribute anonymous reports (a crash
+    /// before the player ever logged in) to an install without a Discord id.
+    #[serde(default)]
+    pub guest_device_id: String,
     /// Final scores from RAM, if the match got that far.
     #[serde(default)]
     pub p1_score: Option<u16>,
@@ -108,35 +112,52 @@ pub struct StoredIncident {
     /// Verified Discord ID (from the JWT, not the request body).
     pub reporter_discord_id: Option<String>,
     pub reporter_username: Option<String>,
+    /// Per-install id for anonymous (unauthenticated) reports.
+    pub reporter_guest_id: Option<String>,
     pub payload: serde_json::Value,
 }
 
-/// POST /match/incident handler. JWT-auth so we can attribute the report
-/// to a Discord identity (and rate-limit per-user later if needed).
+/// POST /match/incident handler. Auth is optional: a valid JWT attributes the
+/// report to a Discord identity, but unauthenticated reports are accepted too
+/// (attributed to the client's guest_device_id) so a crash before the player
+/// ever logged in still reaches the bucket. We can't count on players being
+/// signed in when something breaks.
 ///
 /// Returns 200 even on storage failure — incident-logging that can fail
 /// the player's session is worse than a silently-dropped incident. We
 /// log the error server-side; the bucket's job is best-effort capture.
 pub async fn submit_incident(
     state: axum::extract::State<AppState>,
-    auth: axum_extra::TypedHeader<
-        axum_extra::headers::Authorization<axum_extra::headers::authorization::Bearer>,
+    auth: Option<
+        axum_extra::TypedHeader<
+            axum_extra::headers::Authorization<axum_extra::headers::authorization::Bearer>,
+        >,
     >,
     body: axum::Json<IncidentRequest>,
 ) -> Result<axum::Json<serde_json::Value>, crate::error::AppError> {
-    let claims = crate::auth::verify_token(auth.token(), &state.config.jwt_secret)?;
+    // Verify the token only if one was supplied; an invalid token is treated
+    // as anonymous rather than rejected, so a stale JWT can't swallow a crash.
+    let claims = auth
+        .and_then(|a| crate::auth::verify_token(a.token(), &state.config.jwt_secret).ok());
 
     let mut req = body.0;
     truncate_field(&mut req.net_log_tail, MAX_LOG_BYTES);
     truncate_field(&mut req.ggrs_event_tail, MAX_LOG_BYTES);
+
+    let reporter_guest_id = if req.guest_device_id.trim().is_empty() {
+        None
+    } else {
+        Some(req.guest_device_id.clone())
+    };
 
     let payload = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
     let stored = StoredIncident {
         incident_id: Uuid::new_v4().to_string(),
         origin: "client",
         recorded_at: Utc::now(),
-        reporter_discord_id: Some(claims.sub.clone()),
-        reporter_username: Some(claims.username.clone()),
+        reporter_discord_id: claims.as_ref().map(|c| c.sub.clone()),
+        reporter_username: claims.as_ref().map(|c| c.username.clone()),
+        reporter_guest_id,
         payload,
     };
 
@@ -186,6 +207,7 @@ pub fn record_server_incident(state: &AppState, incident: ServerIncident) {
         recorded_at: Utc::now(),
         reporter_discord_id: None,
         reporter_username: None,
+        reporter_guest_id: None,
         payload: serde_json::to_value(incident).unwrap_or(serde_json::Value::Null),
     };
     let state = state.clone();
@@ -430,7 +452,17 @@ fn incident_issue_body(incident: &StoredIncident, object_name: &str, fingerprint
         .get("frames_advanced")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let reporter = incident.reporter_username.as_deref().unwrap_or("server");
+    let reporter = incident
+        .reporter_username
+        .as_deref()
+        .or_else(|| {
+            incident
+                .reporter_guest_id
+                .as_deref()
+                .map(|_| "guest")
+                .filter(|_| incident.origin == "client")
+        })
+        .unwrap_or("server");
 
     format!(
         "Automated incident from freeplay signaling.\n\n\

@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::Json,
 };
 use axum_extra::{
@@ -15,6 +15,7 @@ use crate::{
     auth::verify_token,
     discord,
     error::AppError,
+    game,
     incidents::{record_server_incident, ServerIncident},
     models::*,
     state::{AppState, ConfirmedResult, PendingResult},
@@ -76,8 +77,10 @@ pub async fn looking_for_game(
     }
 
     let session_id = Uuid::new_v4().to_string();
+    let game = game::from_rom_hash(&req.rom_hash);
 
-    // Pair only with someone matching our app_version AND rom_hash.
+    // Pair only with someone matching our app_version AND rom_hash. The game
+    // rides inside rom_hash (see game.rs), so this also keeps games apart.
     // Snapshot candidate keys first (releasing iter shard locks), then claim
     // one atomically via get_mut + re-check. This closes the TOCTOU window
     // between find and get_mut, and avoids holding an iter while taking a
@@ -159,13 +162,19 @@ pub async fn looking_for_game(
             .player_sessions
             .insert(claims.sub.clone(), session_id.clone());
 
-        let (s, u1, u2) = (state.clone(), claims.username.clone(), opp_username.clone());
-        tokio::spawn(async move { discord::notify_matched(&s, &u1, &u2).await });
+        let (s, u1, u2, g) = (
+            state.clone(),
+            claims.username.clone(),
+            opp_username.clone(),
+            game.clone(),
+        );
+        tokio::spawn(async move { discord::notify_matched(&s, &u1, &u2, &g).await });
 
         tracing::info!(
-            "Matched {} vs {} (rom={})",
+            "Matched {} vs {} (game={} rom={})",
             claims.username,
             opp_username,
+            game,
             &req.rom_hash
         );
         Ok(Json(LfgResponse {
@@ -192,10 +201,15 @@ pub async fn looking_for_game(
             .player_sessions
             .insert(claims.sub.clone(), session_id.clone());
 
-        let (s, u) = (state.clone(), claims.username.clone());
-        tokio::spawn(async move { discord::notify_lfg(&s, &u).await });
+        let (s, u, g) = (state.clone(), claims.username.clone(), game.clone());
+        tokio::spawn(async move { discord::notify_lfg(&s, &u, &g).await });
 
-        tracing::info!("Queued {} (rom={})", claims.username, &req.rom_hash);
+        tracing::info!(
+            "Queued {} (game={} rom={})",
+            claims.username,
+            game,
+            &req.rom_hash
+        );
         Ok(Json(LfgResponse {
             session_id,
             status: MatchStatus::Queued,
@@ -313,11 +327,17 @@ pub async fn lobby_chat(
 
 pub async fn list_lobbies(
     State(state): State<AppState>,
+    Query(q): Query<GameQuery>,
 ) -> Result<Json<LobbyListResponse>, AppError> {
+    let want = game::filter_from_query(q.game.as_deref());
     let mut lobbies: Vec<LobbyRoomSummary> = state
         .spar_rooms
         .iter()
         .filter(|room| !room.private)
+        .filter(|room| {
+            want.as_ref()
+                .is_none_or(|g| *g == game::from_rom_hash(&room.rom_hash))
+        })
         .map(|room| lobby_room_summary(&room))
         .collect();
     lobbies.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -541,7 +561,8 @@ pub async fn accept_challenge(
         challenge.challenger_username.clone(),
         claims.username.clone(),
     );
-    tokio::spawn(async move { discord::notify_matched(&s, &u1, &u2).await });
+    let g = game::from_rom_hash(&challenge.rom_hash);
+    tokio::spawn(async move { discord::notify_matched(&s, &u1, &u2, &g).await });
 
     tracing::info!(
         "Challenge {} accepted: {} vs {} ({:?})",
@@ -682,6 +703,7 @@ fn normalize_lobby_chat(raw: &str) -> Result<String, AppError> {
 fn lobby_room_summary(room: &SparRoom) -> LobbyRoomSummary {
     LobbyRoomSummary {
         id: room.room_id.clone(),
+        game: game::from_rom_hash(&room.rom_hash),
         name: room.name.clone(),
         host_username: room.creator_username.clone(),
         format: room.format.clone(),
@@ -1426,7 +1448,8 @@ pub async fn join_room(
         room.creator_username.clone(),
         claims.username.clone(),
     );
-    tokio::spawn(async move { discord::notify_matched(&s, &u1, &u2).await });
+    let g = game::from_rom_hash(&room.rom_hash);
+    tokio::spawn(async move { discord::notify_matched(&s, &u1, &u2, &g).await });
 
     tracing::info!(
         "Room {} joined: {} (creator) vs {} (joiner)",
@@ -1915,11 +1938,17 @@ pub async fn leave_lobby(
 
 pub async fn list_koh_lobbies(
     State(state): State<AppState>,
+    Query(q): Query<GameQuery>,
 ) -> Result<Json<LobbyListResponse>, AppError> {
+    let want = game::filter_from_query(q.game.as_deref());
     let mut lobbies: Vec<LobbyRoomSummary> = state
         .koh_lobbies
         .iter()
         .filter(|e| !e.value().private)
+        .filter(|e| {
+            want.as_ref()
+                .is_none_or(|g| *g == game::from_rom_hash(&e.value().rom_hash))
+        })
         .map(|e| {
             let l = e.value();
             let host = l
@@ -1931,6 +1960,7 @@ pub async fn list_koh_lobbies(
                 .unwrap_or_else(|| "Host".into());
             LobbyRoomSummary {
                 id: l.id.clone(),
+                game: game::from_rom_hash(&l.rom_hash),
                 name: l.name.clone(),
                 host_username: host,
                 format: l.format.clone(),
@@ -2161,12 +2191,18 @@ pub async fn spectator_state(
 
 pub async fn live_matches(
     State(state): State<AppState>,
+    Query(query): Query<GameQuery>,
 ) -> Result<Json<LiveMatchesResponse>, AppError> {
+    let want = game::filter_from_query(query.game.as_deref());
     let mut matches = Vec::new();
 
     for entry in state.queue.iter() {
         let (sid, q) = entry.pair();
         if q.cancelled {
+            continue;
+        }
+        let match_game = game::from_rom_hash(&q.rom_hash);
+        if want.as_ref().is_some_and(|g| *g != match_game) {
             continue;
         }
         let info = if let Some(ref info) = q.match_info {
@@ -2199,6 +2235,7 @@ pub async fn live_matches(
 
         matches.push(LiveMatch {
             room_id: info.room_id.clone(),
+            game: match_game,
             p1_username,
             p2_username,
             score_p1,

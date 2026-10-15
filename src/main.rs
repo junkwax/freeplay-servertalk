@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod discord;
 mod error;
+mod game;
 mod incidents;
 mod matchmaking;
 mod models;

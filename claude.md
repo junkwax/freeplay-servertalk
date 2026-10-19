@@ -53,6 +53,14 @@ src/
 - JWT uses HS256, signed with `JWT_SECRET` (random 48-byte base64). 24-hour expiry.
 - Claims: `{sub: discord_id, username, exp}`
 
+## Games
+
+The game rides inside `rom_hash` as a prefix (`nbajam:<fnv>@<core>`, `umk3w:<sha>`); an unprefixed hash is MK2.
+Same rule as freeplay-stats (`src/game.rs` in both). Pairing already requires an exact `rom_hash` match, so games
+never meet; `game.rs` only names the game for logs, Discord posts and listings. `GET /lobbies`, `GET /koh` and
+`/matches/live` take `?game=` (absent = `mk2`, so existing clients see what they always saw; `all` = every game) and
+return a `game` field per item. Wavenet cabinets use their own service, freeplay-wavenet, with the same match API.
+
 ## Matchmaking algorithm
 
 ```rust

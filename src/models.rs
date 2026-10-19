@@ -389,12 +389,20 @@ pub struct LobbyChatRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct LobbyRoomSummary {
     pub id: String,
+    pub game: String,
     pub name: String,
     pub host_username: String,
     pub format: LobbyMatchFormat,
     pub players: u8,
     pub private: bool,
     pub status: String,
+}
+
+/// `?game=` on public listings: absent = MK2, `all` = every game (see game.rs).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GameQuery {
+    #[serde(default)]
+    pub game: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -540,6 +548,7 @@ pub struct SpectatorFrame {
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveMatch {
     pub room_id: String,
+    pub game: String,
     pub p1_username: String,
     pub p2_username: String,
     pub score_p1: u16,
